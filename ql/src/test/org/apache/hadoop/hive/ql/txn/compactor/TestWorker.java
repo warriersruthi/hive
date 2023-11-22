@@ -74,7 +74,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
-import static org.powermock.api.mockito.PowerMockito.when;
+import static org.mockito.Mockito.when;
 
 /**
  * Tests for the worker thread and its MR jobs.
@@ -1019,7 +1019,7 @@ public class TestWorker extends CompactorTest {
   public void testFindNextCompactThrowsTException() throws Exception {
     Worker worker = Mockito.spy(new Worker());
     IMetaStoreClient msc = Mockito.mock(IMetaStoreClient.class);
-    Mockito.when(msc.findNextCompact(Mockito.any(FindNextCompactRequest.class))).thenThrow(MetaException.class);
+    when(msc.findNextCompact(Mockito.any(FindNextCompactRequest.class))).thenThrow(MetaException.class);
     worker.msc = msc;
 
     worker.findNextCompactionAndExecute(true, true);
@@ -1042,7 +1042,7 @@ public class TestWorker extends CompactorTest {
     txnHandler.compact(new CompactionRequest("default", "mtwb", CompactionType.MINOR));
 
     CompactorFactory mockedFactory = Mockito.mock(CompactorFactory.class);
-    when(mockedFactory.getCompactor(any(), any(), any(), any())).thenThrow(new RuntimeException());
+    when(mockedFactory.getCompactorPipeline(any(), any(), any(), any())).thenThrow(new RuntimeException());
 
     Worker worker = Mockito.spy(new Worker(mockedFactory));
     worker.setConf(conf);
@@ -1180,19 +1180,19 @@ public class TestWorker extends CompactorTest {
   }
 
   // With high timeout, but fast run we should finish without a problem
-  @Test(timeout=1000)
+  @Test(timeout=2000)
   public void testNormalRun() throws Exception {
     runTimeoutTest(10000, false, true);
   }
 
   // With low timeout, but slow run we should finish without a problem
-  @Test(timeout=1000)
+  @Test(timeout=2000)
   public void testTimeoutWithInterrupt() throws Exception {
     runTimeoutTest(1, true, false);
   }
 
   // With low timeout, but slow run we should finish without a problem, even if the interrupt is swallowed
-  @Test(timeout=1000)
+  @Test(timeout=2000)
   public void testTimeoutWithoutInterrupt() throws Exception {
     runTimeoutTest(1, true, true);
   }
@@ -1201,6 +1201,8 @@ public class TestWorker extends CompactorTest {
     ExecutorService executor = Executors.newSingleThreadExecutor();
     HiveConf timeoutConf = new HiveConf(conf);
     timeoutConf.setTimeVar(HiveConf.ConfVars.HIVE_COMPACTOR_WORKER_TIMEOUT, timeout, TimeUnit.MILLISECONDS);
+    timeoutConf.setTimeVar(HiveConf.ConfVars.HIVE_COMPACTOR_WORKER_SLEEP_TIME, 20, TimeUnit.MILLISECONDS);
+    timeoutConf.setTimeVar(HiveConf.ConfVars.HIVE_COMPACTOR_WORKER_MAX_SLEEP_TIME, 20, TimeUnit.MILLISECONDS);
 
     TimeoutWorker timeoutWorker = getTimeoutWorker(timeoutConf, executor,
         runForever, swallowInterrupt, new CountDownLatch(2));

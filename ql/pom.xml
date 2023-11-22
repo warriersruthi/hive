@@ -17,7 +17,7 @@
   <parent>
     <groupId>org.apache.hive</groupId>
     <artifactId>hive</artifactId>
-    <version>4.0.0-SNAPSHOT</version>
+    <version>4.0.0-beta-2-SNAPSHOT</version>
     <relativePath>../pom.xml</relativePath>
   </parent>
   <artifactId>hive-exec</artifactId>
@@ -25,7 +25,6 @@
   <name>Hive Query Language</name>
   <properties>
     <hive.path.to.root>..</hive.path.to.root>
-    <powermock.version>2.0.2</powermock.version>
     <reflections.version>0.10.2</reflections.version>
     <atlas.version>2.1.0</atlas.version>
   </properties>
@@ -207,7 +206,6 @@
     <dependency>
       <groupId>org.apache.commons</groupId>
       <artifactId>commons-text</artifactId>
-      <version>${commons-text.version}</version>
     </dependency>
     <dependency>
       <groupId>javolution</groupId>
@@ -241,7 +239,6 @@
     <dependency>
       <groupId>org.apache.avro</groupId>
       <artifactId>avro-mapred</artifactId>
-      <classifier>hadoop2</classifier>
     </dependency>
     <dependency>
       <groupId>org.apache.ant</groupId>
@@ -515,10 +512,6 @@
     <dependency>
       <groupId>com.google.guava</groupId>
       <artifactId>guava</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>com.googlecode.javaewah</groupId>
-      <artifactId>JavaEWAH</artifactId>
     </dependency>
     <dependency>
       <groupId>com.google.code.gson</groupId>
@@ -814,21 +807,25 @@
       <scope>test</scope>
     </dependency>
     <dependency>
-      <groupId>org.powermock</groupId>
-      <artifactId>powermock-module-junit4</artifactId>
-      <version>${powermock.version}</version>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>org.powermock</groupId>
-      <artifactId>powermock-api-mockito2</artifactId>
-      <version>${powermock.version}</version>
+      <groupId>org.mockito</groupId>
+      <artifactId>mockito-inline</artifactId>
+      <version>${mockito-inline.version}</version>
       <scope>test</scope>
     </dependency>
     <dependency>
       <groupId>com.google.guava</groupId>
       <artifactId>guava-testlib</artifactId>
       <version>${guava.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-jdbc</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-core</artifactId>
       <scope>test</scope>
     </dependency>
     <dependency>
@@ -862,17 +859,6 @@
       <groupId>com.sun.jersey.contribs</groupId>
       <artifactId>jersey-multipart</artifactId>
       <version>${jersey.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.kafka</groupId>
-      <artifactId>kafka-clients</artifactId>
-      <version>${kafka.version}</version>
-      <exclusions>
-        <exclusion>
-          <groupId>org.apache.shiro</groupId>
-          <artifactId>shiro-crypto-cipher</artifactId>
-        </exclusion>
-      </exclusions>
     </dependency>
     <dependency>
       <groupId>com.esri.geometry</groupId>
@@ -1073,7 +1059,6 @@
                   <include>org.apache.hive.shims:hive-shims-0.23</include>
                   <include>org.apache.hive.shims:hive-shims-0.23</include>
                   <include>org.apache.hive.shims:hive-shims-common</include>
-                  <include>com.googlecode.javaewah:JavaEWAH</include>
                   <include>javolution:javolution</include>
                   <include>com.google.protobuf:protobuf-java</include>
                   <include>io.airlift:aircompressor</include>
@@ -1102,6 +1087,7 @@
                   <include>com.esri.geometry:esri-geometry-api</include>
                   <include>org.roaringbitmap:RoaringBitmap</include>
                   <include>org.roaringbitmap:shims</include>
+                  <include>com.github.luben:zstd-jni</include>
                 </includes>
               </artifactSet>
               <filters>

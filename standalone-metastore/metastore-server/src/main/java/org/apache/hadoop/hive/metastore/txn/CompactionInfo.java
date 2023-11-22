@@ -17,6 +17,7 @@
  */
 package org.apache.hadoop.hive.metastore.txn;
 
+import org.apache.commons.lang3.builder.ToStringBuilder;
 import org.apache.hadoop.hive.common.ValidCompactorWriteIdList;
 import org.apache.hadoop.hive.metastore.api.CompactionInfoStruct;
 import org.apache.hadoop.hive.metastore.api.CompactionType;
@@ -60,9 +61,13 @@ public class CompactionInfo implements Comparable<CompactionInfo> {
   public boolean hasOldAbort = false;
   public long retryRetention = 0;
   public long nextTxnId = 0;
+  public long minOpenWriteId = -1;
   public long txnId = 0;
   public long commitTime = 0;
   public String poolName;
+  public int numberOfBuckets = 0;
+  public String orderByClause;
+  public long minOpenWriteTxnId = 0;
 
   /**
    * The highest write id that the compaction job will pay attention to.
@@ -74,8 +79,8 @@ public class CompactionInfo implements Comparable<CompactionInfo> {
   public Set<Long> writeIds;
   public boolean hasUncompactedAborts;
 
-  byte[] metaInfo;
-  String hadoopJobId;
+  public byte[] metaInfo;
+  public String hadoopJobId;
   public String errorMessage;
 
   private String fullPartitionName = null;
@@ -88,12 +93,12 @@ public class CompactionInfo implements Comparable<CompactionInfo> {
     this.partName = partName;
     this.type = type;
   }
-  CompactionInfo(long id, String dbname, String tableName, String partName, char state) {
+  public CompactionInfo(long id, String dbname, String tableName, String partName, char state) {
     this(dbname, tableName, partName, null);
     this.id = id;
     this.state = state;
   }
-  CompactionInfo() {}
+  public CompactionInfo() {}
 
   public String getProperty(String key) {
     if (propertiesMap == null) {
@@ -112,7 +117,8 @@ public class CompactionInfo implements Comparable<CompactionInfo> {
 
   public String getFullPartitionName() {
     if (fullPartitionName == null) {
-      StringBuilder buf = new StringBuilder(dbname);
+      StringBuilder buf = new StringBuilder();
+      buf.append(dbname);
       buf.append('.');
       buf.append(tableName);
       if (partName != null) {
@@ -146,24 +152,36 @@ public class CompactionInfo implements Comparable<CompactionInfo> {
   public int compareTo(CompactionInfo o) {
     return getFullPartitionName().compareTo(o.getFullPartitionName());
   }
+
   public String toString() {
-    return "id:" + id + "," +
-      "dbname:" + dbname + "," +
-      "tableName:" + tableName + "," +
-      "partName:" + partName + "," +
-      "state:" + state + "," +
-      "type:" + type + "," +
-      "enqueueTime:" + enqueueTime + "," +
-      "start:" + start + "," +
-      "properties:" + properties + "," +
-      "runAs:" + runAs + "," +
-      "tooManyAborts:" + tooManyAborts + "," +
-      "hasOldAbort:" + hasOldAbort + "," +
-      "highestWriteId:" + highestWriteId + "," +
-      "errorMessage:" + errorMessage + "," +
-      "workerId: " + workerId + "," +
-      "initiatorId: " + initiatorId + "," +
-      "retryRetention" + retryRetention;
+    return new ToStringBuilder(this)
+        .append("id", id)
+        .append("dbname", dbname)
+        .append("tableName", tableName)
+        .append("partName", partName)
+        .append("state", state)
+        .append("type", type)
+        .append("enqueueTime", enqueueTime)
+        .append("commitTime", commitTime)
+        .append("start", start)
+        .append("properties", properties)
+        .append("runAs", runAs)
+        .append("tooManyAborts", tooManyAborts)
+        .append("hasOldAbort", hasOldAbort)
+        .append("highestWriteId", highestWriteId)
+        .append("errorMessage", errorMessage)
+        .append("workerId", workerId)
+        .append("workerVersion", workerVersion)
+        .append("initiatorId", initiatorId)
+        .append("initiatorVersion", initiatorVersion)
+        .append("retryRetention", retryRetention)
+        .append("txnId", txnId)
+        .append("nextTxnId", nextTxnId)
+        .append("poolName", poolName)
+        .append("numberOfBuckets", numberOfBuckets)
+        .append("orderByClause", orderByClause)
+        .append("minOpenWriteTxnId", minOpenWriteTxnId)
+        .build();
   }
 
   @Override
@@ -215,6 +233,8 @@ public class CompactionInfo implements Comparable<CompactionInfo> {
     fullCi.txnId = rs.getLong(21);
     fullCi.commitTime = rs.getLong(22);
     fullCi.poolName = rs.getString(23);
+    fullCi.numberOfBuckets = rs.getInt(24);
+    fullCi.orderByClause = rs.getString(25);
     return fullCi;
   }
   static void insertIntoCompletedCompactions(PreparedStatement pStmt, CompactionInfo ci, long endTime) throws SQLException, MetaException {
@@ -241,6 +261,8 @@ public class CompactionInfo implements Comparable<CompactionInfo> {
     pStmt.setLong(21, ci.txnId);
     pStmt.setLong(22, ci.commitTime);
     pStmt.setString(23, ci.poolName);
+    pStmt.setInt(24, ci.numberOfBuckets);
+    pStmt.setString(25, ci.orderByClause);
   }
 
   public static CompactionInfo compactionStructToInfo(CompactionInfoStruct cr) {
@@ -278,8 +300,14 @@ public class CompactionInfo implements Comparable<CompactionInfo> {
     if (cr.isSetRetryRetention()) {
       ci.retryRetention = cr.getRetryRetention();
     }
-    if(cr.isSetPoolname()) {
+    if (cr.isSetPoolname()) {
       ci.poolName = cr.getPoolname();
+    }
+    if (cr.isSetNumberOfBuckets()) {
+      ci.numberOfBuckets = cr.getNumberOfBuckets();
+    }
+    if (cr.isSetOrderByClause()) {
+      ci.orderByClause = cr.getOrderByClause();
     }
     return ci;
   }
@@ -302,6 +330,8 @@ public class CompactionInfo implements Comparable<CompactionInfo> {
     cr.setEnqueueTime(ci.enqueueTime);
     cr.setRetryRetention(ci.retryRetention);
     cr.setPoolname(ci.poolName);
+    cr.setNumberOfBuckets(ci.numberOfBuckets);
+    cr.setOrderByClause(ci.orderByClause);
     return cr;
   }
 
@@ -323,5 +353,9 @@ public class CompactionInfo implements Comparable<CompactionInfo> {
   public void setWriteIds(boolean hasUncompactedAborts, Set<Long> writeIds) {
     this.hasUncompactedAborts = hasUncompactedAborts;
     this.writeIds = writeIds;
+  }
+
+  public boolean isAbortedTxnCleanup() {
+    return type == CompactionType.ABORT_TXN_CLEANUP;
   }
 }

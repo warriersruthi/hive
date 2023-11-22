@@ -29,18 +29,31 @@ import org.apache.hadoop.hive.common.classification.InterfaceStability;
 import org.apache.hadoop.hive.common.type.SnapshotContext;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.metastore.HiveMetaHook;
+import org.apache.hadoop.hive.metastore.api.ColumnStatistics;
+import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
 import org.apache.hadoop.hive.metastore.api.EnvironmentContext;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.metastore.api.LockType;
 import org.apache.hadoop.hive.metastore.api.MetaException;
 import org.apache.hadoop.hive.metastore.api.Table;
+import org.apache.hadoop.hive.ql.Context;
 import org.apache.hadoop.hive.ql.Context.Operation;
+import org.apache.hadoop.hive.ql.ddl.DDLOperationContext;
+import org.apache.hadoop.hive.ql.ErrorMsg;
 import org.apache.hadoop.hive.ql.ddl.table.AbstractAlterTableDesc;
 import org.apache.hadoop.hive.ql.ddl.table.AlterTableType;
+import org.apache.hadoop.hive.ql.ddl.table.create.like.CreateTableLikeDesc;
+import org.apache.hadoop.hive.ql.exec.ColumnInfo;
 import org.apache.hadoop.hive.ql.hooks.WriteEntity;
+import org.apache.hadoop.hive.ql.io.StorageFormatDescriptor;
+import org.apache.hadoop.hive.ql.io.sarg.SearchArgument;
+import org.apache.hadoop.hive.ql.parse.AlterTableSnapshotRefSpec;
 import org.apache.hadoop.hive.ql.parse.AlterTableExecuteSpec;
+import org.apache.hadoop.hive.ql.parse.DeleteSemanticAnalyzer;
+import org.apache.hadoop.hive.ql.parse.StorageFormat.StorageHandlerTypes;
 import org.apache.hadoop.hive.ql.parse.TransformSpec;
 import org.apache.hadoop.hive.ql.parse.SemanticException;
+import org.apache.hadoop.hive.ql.parse.UpdateSemanticAnalyzer;
 import org.apache.hadoop.hive.ql.plan.DynamicPartitionCtx;
 import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
 import org.apache.hadoop.hive.ql.plan.FileSinkDesc;
@@ -54,6 +67,7 @@ import org.apache.hadoop.mapred.InputFormat;
 import org.apache.hadoop.mapred.JobConf;
 import org.apache.hadoop.mapred.OutputFormat;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -195,6 +209,10 @@ public interface HiveStorageHandler extends Configurable {
   {
     return null;
   }
+  
+  default StorageHandlerTypes getType() {
+    return StorageHandlerTypes.DEFAULT;
+  }
 
   default LockType getLockType(WriteEntity writeEntity){
     return LockType.EXCLUSIVE;
@@ -244,6 +262,85 @@ public interface HiveStorageHandler extends Configurable {
   }
 
   /**
+   * Return some col statistics (Lower bounds, Upper bounds, Null value counts, NaN, total counts) calculated by
+   * the underlying storage handler implementation.
+   * @param table
+   * @return A List of Column Statistics Objects, can be null
+   */
+  default List<ColumnStatisticsObj>getColStatistics(org.apache.hadoop.hive.ql.metadata.Table table) {
+    return null;
+  }
+
+  /**
+   * Set column stats for non-native tables
+   * @param table
+   * @param colStats
+   * @return boolean
+   */
+  default boolean setColStatistics(org.apache.hadoop.hive.ql.metadata.Table table, List<ColumnStatistics> colStats) {
+    return false;
+  }
+
+  /**
+   * Check if the storage handler can provide col statistics.
+   * @param tbl
+   * @return true if the storage handler can supply the col statistics
+   */
+  default boolean canProvideColStatistics(org.apache.hadoop.hive.ql.metadata.Table tbl) {
+    return false;
+  }
+
+  /**
+   * Check if the storage handler can set col statistics.
+   * @return true if the storage handler can set the col statistics
+   */
+  default boolean canSetColStatistics(org.apache.hadoop.hive.ql.metadata.Table tbl) {
+    return false;
+  }
+
+  /**
+   * Check if the storage handler answer a few queries like count(1) purely using stats.
+   * @return true if the storage handler can answer query using statistics
+   */
+  default boolean canComputeQueryUsingStats(org.apache.hadoop.hive.ql.metadata.Table tbl) {
+    return false;
+  }
+
+  /**
+   *
+   * Gets the storage format descriptor to be used for temp table for LOAD data.
+   * @param table table object
+   * @return StorageFormatDescriptor if the storage handler can support load data
+   */
+  default StorageFormatDescriptor getStorageFormatDescriptor(Table table) throws SemanticException {
+    return null;
+  }
+
+  /**
+   * Checks whether the table supports appending data files to the table.
+   * @param table the table
+   * @param withPartClause whether a partition is specified
+   * @return true if the table can append files directly to the table
+   * @throws SemanticException in case of any error.
+   */
+  default boolean supportsAppendData(Table table, boolean withPartClause) throws SemanticException {
+    return false;
+  }
+
+  /**
+   * Appends files to the table
+   * @param tbl the table object.
+   * @param fromURI the source of files.
+   * @param isOverwrite whether to overwrite the existing table data.
+   * @param partitionSpec the partition spec.
+   * @throws SemanticException in case of any error
+   */
+  default void appendFiles(Table tbl, URI fromURI, boolean isOverwrite, Map<String, String> partitionSpec)
+      throws SemanticException {
+    throw new SemanticException(ErrorMsg.LOAD_INTO_NON_NATIVE.getMsg());
+  }
+
+  /**
    * Check if CTAS and CMV operations should behave in a direct-insert manner (i.e. no move task).
    * <p>
    * Please note that the atomicity of the operation will suffer in this case, i.e. the created table might become
@@ -268,6 +365,43 @@ public interface HiveStorageHandler extends Configurable {
    */
   default boolean alwaysUnpartitioned() {
     return false;
+  }
+
+  /**
+   * Retains storage handler specific properties during CTLT.
+   * @param tbl        the table
+   * @param desc       the table descriptor
+   * @param origParams the original table properties
+   */
+  default void setTableParametersForCTLT(org.apache.hadoop.hive.ql.metadata.Table tbl, CreateTableLikeDesc desc,
+      Map<String, String> origParams) {
+  }
+
+  /**
+   * Extract the native properties of the table which aren't stored in the HMS
+   * @param table the table
+   * @return map with native table level properties
+   */
+  default Map<String, String> getNativeProperties(org.apache.hadoop.hive.ql.metadata.Table table) {
+    return new HashMap<>();
+  }
+
+  /**
+   * Returns whether the data should be overwritten for the specific operation.
+   * @param mTable the table.
+   * @param operation operation type.
+   * @return if the data should be overwritten for the specified operation.
+   */
+  default boolean shouldOverwrite(org.apache.hadoop.hive.ql.metadata.Table mTable, Context.Operation operation) {
+    return false;
+  }
+
+  /**
+   * Adds specific configurations to session for create table command.
+   * @param tblProps table properties
+   * @param hiveConf configuration
+   */
+  default void addResourcesForCreateTable(Map<String, String> tblProps, HiveConf hiveConf) {
   }
 
   enum AcidSupportType {
@@ -311,8 +445,8 @@ public interface HiveStorageHandler extends Configurable {
   }
 
   /**
-   * {@link org.apache.hadoop.hive.ql.parse.UpdateDeleteSemanticAnalyzer} rewrites DELETE/UPDATE queries into INSERT
-   * queries.
+   * {@link UpdateSemanticAnalyzer} rewrites UPDATE and
+   * {@link DeleteSemanticAnalyzer} rewrites DELETE queries into INSERT queries.
    * - DELETE FROM T WHERE A = 32 is rewritten into
    * INSERT INTO T SELECT &lt;selectCols&gt; FROM T WHERE A = 32 SORT BY &lt;sortCols&gt;.
    * - UPDATE T SET B=12 WHERE A = 32 is rewritten into
@@ -332,8 +466,13 @@ public interface HiveStorageHandler extends Configurable {
     return Collections.emptyList();
   }
 
+  default FieldSchema getRowId() {
+    throw new UnsupportedOperationException();
+  }
+
   /**
-   * {@link org.apache.hadoop.hive.ql.parse.UpdateDeleteSemanticAnalyzer} rewrites DELETE/UPDATE queries into INSERT
+   * {@link UpdateSemanticAnalyzer} rewrites UPDATE and
+   * {@link DeleteSemanticAnalyzer} rewrites DELETE queries into INSERT
    * queries. E.g. DELETE FROM T WHERE A = 32 is rewritten into
    * INSERT INTO T SELECT &lt;selectCols&gt; FROM T WHERE A = 32 SORT BY &lt;sortCols&gt;.
    *
@@ -421,15 +560,20 @@ public interface HiveStorageHandler extends Configurable {
   default boolean commitInMoveTask() {
     return false;
   }
-
+  
   /**
    * Commits the inserts for the non-native tables. Used in the {@link org.apache.hadoop.hive.ql.exec.MoveTask}.
    * @param commitProperties Commit properties which are needed for the handler based commit
-   * @param overwrite If this is an INSERT OVERWRITE then it is true
+   * @param operation the operation type
    * @throws HiveException If there is an error during commit
    */
-  default void storageHandlerCommit(Properties commitProperties, boolean overwrite) throws HiveException {
+  default void storageHandlerCommit(Properties commitProperties, Operation operation) throws HiveException {
     throw new UnsupportedOperationException();
+  }
+
+  @Deprecated
+  default void storageHandlerCommit(Properties commitProperties, boolean overwrite) throws HiveException {
+    storageHandlerCommit(commitProperties, overwrite ? Operation.IOW : Operation.OTHER);
   }
 
   /**
@@ -460,12 +604,31 @@ public interface HiveStorageHandler extends Configurable {
     return false;
   }
 
+  /**
+   * Introduced by HIVE-25457 for iceberg to query metadata table.
+   * @return true if the storage handler can support it
+   * @deprecated Use {@link #isTableMetaRefSupported()}
+   */
+  @Deprecated
   default boolean isMetadataTableSupported() {
+    return isTableMetaRefSupported();
+  }
+
+  /**
+   * Check whether the table supports metadata references which mainly include branch, tag and metadata tables.
+   * @return true if the storage handler can support it
+   */
+  default boolean isTableMetaRefSupported() {
     return false;
   }
 
   default boolean isValidMetadataTable(String metaTableName) {
     return false;
+  }
+
+  default org.apache.hadoop.hive.ql.metadata.Table checkAndSetTableMetaRef(
+      org.apache.hadoop.hive.ql.metadata.Table hmsTable, String tableMetaRef) throws SemanticException {
+    return null;
   }
 
   /**
@@ -495,6 +658,10 @@ public interface HiveStorageHandler extends Configurable {
   default void executeOperation(org.apache.hadoop.hive.ql.metadata.Table table, AlterTableExecuteSpec executeSpec) {
   }
 
+  default void alterTableSnapshotRefOperation(org.apache.hadoop.hive.ql.metadata.Table table,
+      AlterTableSnapshotRefSpec alterTableSnapshotRefSpec) {
+  }
+
   /**
    * Gets whether this storage handler supports snapshots.
    * @return true means snapshots are supported false otherwise
@@ -520,5 +687,57 @@ public interface HiveStorageHandler extends Configurable {
    */
   default void prepareAlterTableEnvironmentContext(AbstractAlterTableDesc alterTableDesc,
       EnvironmentContext environmentContext) {
+  }
+
+  default Boolean hasAppendsOnly(org.apache.hadoop.hive.ql.metadata.Table hmsTable, SnapshotContext since) {
+    return null;
+  }
+
+  /**
+   * Checks if storage handler supports Show Partitions and returns a list of partitions
+   * @return List of partitions
+   * @throws UnsupportedOperationException
+   * @throws HiveException
+   */
+  default List<String> showPartitions(DDLOperationContext context,
+      org.apache.hadoop.hive.ql.metadata.Table tbl) throws UnsupportedOperationException, HiveException {
+    throw new UnsupportedOperationException("Storage handler does not support show partitions command");
+  }
+
+  default void validatePartSpec(org.apache.hadoop.hive.ql.metadata.Table hmsTable, Map<String, String> partitionSpec)
+      throws SemanticException {
+    throw new UnsupportedOperationException("Storage handler does not support validation of partition values");
+  }
+
+  default boolean canUseTruncate(org.apache.hadoop.hive.ql.metadata.Table hmsTable, Map<String, String> partitionSpec)
+      throws SemanticException {
+    return true;
+  }
+
+  default List<String> getPartitionNames(org.apache.hadoop.hive.ql.metadata.Table hmsTable,
+      Map<String, String> partitionSpec) throws SemanticException {
+    throw new UnsupportedOperationException("Storage handler does not support getting partitions " +
+            "by a partition specification.");
+  }
+
+  default ColumnInfo getColumnInfo(org.apache.hadoop.hive.ql.metadata.Table hmsTable, String colName)
+      throws SemanticException {
+    throw new UnsupportedOperationException("Storage handler does not support getting column type " +
+            "for a specific column.");
+  }
+
+  default boolean canPerformMetadataDelete(org.apache.hadoop.hive.ql.metadata.Table hmsTable, String branchName,
+    SearchArgument searchArgument) {
+    return false;
+  }
+  default List<FieldSchema> getPartitionKeys(org.apache.hadoop.hive.ql.metadata.Table hmsTable) {
+    throw new UnsupportedOperationException("Storage handler does not support getting partition keys " +
+            "for a table.");
+  }
+
+  default List<Partition> getPartitionsByExpr(org.apache.hadoop.hive.ql.metadata.Table hmsTable, ExprNodeDesc desc)
+          throws SemanticException {
+    throw new UnsupportedOperationException("Storage handler does not support getting partitions by expression " +
+            "for a table.");
   }
 }

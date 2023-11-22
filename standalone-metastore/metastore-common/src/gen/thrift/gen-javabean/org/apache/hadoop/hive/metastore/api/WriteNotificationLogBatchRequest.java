@@ -608,14 +608,14 @@ package org.apache.hadoop.hive.metastore.api;
           case 4: // REQUEST_LIST
             if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
               {
-                org.apache.thrift.protocol.TList _list976 = iprot.readListBegin();
-                struct.requestList = new java.util.ArrayList<WriteNotificationLogRequest>(_list976.size);
-                @org.apache.thrift.annotation.Nullable WriteNotificationLogRequest _elem977;
-                for (int _i978 = 0; _i978 < _list976.size; ++_i978)
+                org.apache.thrift.protocol.TList _list1074 = iprot.readListBegin();
+                struct.requestList = new java.util.ArrayList<WriteNotificationLogRequest>(_list1074.size);
+                @org.apache.thrift.annotation.Nullable WriteNotificationLogRequest _elem1075;
+                for (int _i1076 = 0; _i1076 < _list1074.size; ++_i1076)
                 {
-                  _elem977 = new WriteNotificationLogRequest();
-                  _elem977.read(iprot);
-                  struct.requestList.add(_elem977);
+                  _elem1075 = new WriteNotificationLogRequest();
+                  _elem1075.read(iprot);
+                  struct.requestList.add(_elem1075);
                 }
                 iprot.readListEnd();
               }
@@ -656,9 +656,9 @@ package org.apache.hadoop.hive.metastore.api;
         oprot.writeFieldBegin(REQUEST_LIST_FIELD_DESC);
         {
           oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRUCT, struct.requestList.size()));
-          for (WriteNotificationLogRequest _iter979 : struct.requestList)
+          for (WriteNotificationLogRequest _iter1077 : struct.requestList)
           {
-            _iter979.write(oprot);
+            _iter1077.write(oprot);
           }
           oprot.writeListEnd();
         }
@@ -686,9 +686,9 @@ package org.apache.hadoop.hive.metastore.api;
       oprot.writeString(struct.table);
       {
         oprot.writeI32(struct.requestList.size());
-        for (WriteNotificationLogRequest _iter980 : struct.requestList)
+        for (WriteNotificationLogRequest _iter1078 : struct.requestList)
         {
-          _iter980.write(oprot);
+          _iter1078.write(oprot);
         }
       }
     }
@@ -703,14 +703,14 @@ package org.apache.hadoop.hive.metastore.api;
       struct.table = iprot.readString();
       struct.setTableIsSet(true);
       {
-        org.apache.thrift.protocol.TList _list981 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
-        struct.requestList = new java.util.ArrayList<WriteNotificationLogRequest>(_list981.size);
-        @org.apache.thrift.annotation.Nullable WriteNotificationLogRequest _elem982;
-        for (int _i983 = 0; _i983 < _list981.size; ++_i983)
+        org.apache.thrift.protocol.TList _list1079 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
+        struct.requestList = new java.util.ArrayList<WriteNotificationLogRequest>(_list1079.size);
+        @org.apache.thrift.annotation.Nullable WriteNotificationLogRequest _elem1080;
+        for (int _i1081 = 0; _i1081 < _list1079.size; ++_i1081)
         {
-          _elem982 = new WriteNotificationLogRequest();
-          _elem982.read(iprot);
-          struct.requestList.add(_elem982);
+          _elem1080 = new WriteNotificationLogRequest();
+          _elem1080.read(iprot);
+          struct.requestList.add(_elem1080);
         }
       }
       struct.setRequestListIsSet(true);

@@ -33,9 +33,12 @@ import static org.apache.hadoop.hive.common.AcidConstants.SOFT_DELETE_TABLE;
 import static org.apache.hadoop.hive.conf.Constants.MATERIALIZED_VIEW_REWRITING_TIME_WINDOW;
 import static org.apache.hadoop.hive.conf.HiveConf.ConfVars.HIVE_LOAD_DYNAMIC_PARTITIONS_SCAN_SPECIFIC_PARTITIONS;
 import static org.apache.hadoop.hive.conf.HiveConf.ConfVars.HIVE_WRITE_NOTIFICATION_MAX_BATCH_SIZE;
+import static org.apache.hadoop.hive.metastore.api.hive_metastoreConstants.CTAS_LEGACY_CONFIG;
 import static org.apache.hadoop.hive.metastore.api.hive_metastoreConstants.META_TABLE_STORAGE;
 import static org.apache.hadoop.hive.metastore.utils.MetaStoreUtils.convertToGetPartitionsByNamesRequest;
 import static org.apache.hadoop.hive.metastore.utils.MetaStoreUtils.getDefaultCatalog;
+import static org.apache.hadoop.hive.ql.ddl.DDLUtils.isIcebergStatsSource;
+import static org.apache.hadoop.hive.ql.ddl.DDLUtils.isIcebergTable;
 import static org.apache.hadoop.hive.ql.io.AcidUtils.getFullTableName;
 import static org.apache.hadoop.hive.ql.metadata.HiveRelOptMaterialization.RewriteAlgorithm.CALCITE;
 import static org.apache.hadoop.hive.ql.metadata.HiveRelOptMaterialization.RewriteAlgorithm.ALL;
@@ -94,22 +97,30 @@ import org.apache.hadoop.hdfs.DFSUtilClient;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.hadoop.hive.common.FileUtils;
 import org.apache.hadoop.hive.common.HiveStatsUtils;
+import org.apache.hadoop.hive.common.MaterializationSnapshot;
 import org.apache.hadoop.hive.common.StatsSetupConst;
 import org.apache.hadoop.hive.common.TableName;
 import org.apache.hadoop.hive.common.ValidReaderWriteIdList;
 import org.apache.hadoop.hive.common.ValidTxnList;
 import org.apache.hadoop.hive.common.ValidWriteIdList;
+import org.apache.hadoop.hive.common.DataCopyStatistics;
 import org.apache.hadoop.hive.common.classification.InterfaceAudience.LimitedPrivate;
 import org.apache.hadoop.hive.common.classification.InterfaceStability.Unstable;
 import org.apache.hadoop.hive.common.log.InPlaceUpdate;
 import org.apache.hadoop.hive.conf.Constants;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+import org.apache.hadoop.hive.metastore.api.AbortTxnsRequest;
 import org.apache.hadoop.hive.metastore.api.CompactionRequest;
+import org.apache.hadoop.hive.metastore.api.CreateTableRequest;
 import org.apache.hadoop.hive.metastore.api.GetPartitionsByNamesRequest;
 import org.apache.hadoop.hive.metastore.api.GetTableRequest;
+import org.apache.hadoop.hive.metastore.api.SourceTable;
 import org.apache.hadoop.hive.metastore.api.UpdateTransactionalStatsRequest;
 import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
+import org.apache.hadoop.hive.metastore.conf.MetastoreConf;
+import org.apache.hadoop.hive.metastore.utils.RetryUtilities;
+import org.apache.hadoop.hive.ql.ddl.table.AlterTableType;
 import org.apache.hadoop.hive.ql.io.HdfsUtils;
 import org.apache.hadoop.hive.metastore.HiveMetaException;
 import org.apache.hadoop.hive.metastore.HiveMetaHook;
@@ -151,6 +162,7 @@ import org.apache.hadoop.hive.metastore.api.GetPartitionsPsWithAuthRequest;
 import org.apache.hadoop.hive.metastore.api.GetPartitionsPsWithAuthResponse;
 import org.apache.hadoop.hive.metastore.api.GetRoleGrantsForPrincipalRequest;
 import org.apache.hadoop.hive.metastore.api.GetRoleGrantsForPrincipalResponse;
+import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
 import org.apache.hadoop.hive.metastore.api.HiveObjectPrivilege;
 import org.apache.hadoop.hive.metastore.api.HiveObjectRef;
 import org.apache.hadoop.hive.metastore.api.HiveObjectType;
@@ -177,6 +189,7 @@ import org.apache.hadoop.hive.metastore.api.SQLNotNullConstraint;
 import org.apache.hadoop.hive.metastore.api.SQLPrimaryKey;
 import org.apache.hadoop.hive.metastore.api.SQLUniqueConstraint;
 import org.apache.hadoop.hive.metastore.api.SetPartitionsStatsRequest;
+import org.apache.hadoop.hive.metastore.api.ShowCompactRequest;
 import org.apache.hadoop.hive.metastore.api.ShowCompactResponse;
 import org.apache.hadoop.hive.metastore.api.SkewedInfo;
 import org.apache.hadoop.hive.metastore.api.UniqueConstraintsRequest;
@@ -190,11 +203,11 @@ import org.apache.hadoop.hive.metastore.api.WMTrigger;
 import org.apache.hadoop.hive.metastore.api.WMValidateResourcePlanResponse;
 import org.apache.hadoop.hive.metastore.api.WriteNotificationLogRequest;
 import org.apache.hadoop.hive.metastore.api.WriteNotificationLogBatchRequest;
-import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
+import org.apache.hadoop.hive.metastore.api.AbortCompactionRequest;
+import org.apache.hadoop.hive.metastore.api.AbortCompactResponse;
 import org.apache.hadoop.hive.metastore.ReplChangeManager;
 import org.apache.hadoop.hive.metastore.utils.MetaStoreServerUtils;
 import org.apache.hadoop.hive.metastore.utils.MetaStoreUtils;
-import org.apache.hadoop.hive.metastore.api.ShowCompactRequest;
 import org.apache.hadoop.hive.ql.ErrorMsg;
 import org.apache.hadoop.hive.ql.ddl.database.drop.DropDatabaseDesc;
 import org.apache.hadoop.hive.ql.exec.AbstractFileMergeOperator;
@@ -212,6 +225,7 @@ import org.apache.hadoop.hive.ql.log.PerfLogger;
 import org.apache.hadoop.hive.ql.optimizer.calcite.rules.views.HiveMaterializedViewUtils;
 import org.apache.hadoop.hive.ql.optimizer.listbucketingpruner.ListBucketingPrunerUtils;
 import org.apache.hadoop.hive.ql.parse.ASTNode;
+import org.apache.hadoop.hive.ql.parse.AlterTableSnapshotRefSpec;
 import org.apache.hadoop.hive.ql.parse.AlterTableExecuteSpec;
 import org.apache.hadoop.hive.ql.parse.SemanticException;
 import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
@@ -254,6 +268,7 @@ public class Hive {
   private SynchronizedMetaStoreClient syncMetaStoreClient;
   private UserGroupInformation owner;
   private boolean isAllowClose = true;
+  private final static int DEFAULT_BATCH_DECAYING_FACTOR = 2;
 
   // metastore calls timing information
   private final ConcurrentHashMap<String, Long> metaCallTimeMap = new ConcurrentHashMap<>();
@@ -869,9 +884,15 @@ public class Hive {
       if (newTbl.getParameters() != null) {
         newTbl.getParameters().remove(hive_metastoreConstants.DDL_TIME);
       }
-      newTbl.checkValidity(conf);
       if (environmentContext == null) {
         environmentContext = new EnvironmentContext();
+      }
+      if (isRename(environmentContext)) {
+        newTbl.validateName(conf);
+        environmentContext.putToProperties(HiveMetaHook.OLD_TABLE_NAME, tblName);
+        environmentContext.putToProperties(HiveMetaHook.OLD_DB_NAME, dbName);
+      } else {
+        newTbl.checkValidity(conf);
       }
       if (cascade) {
         environmentContext.putToProperties(StatsSetupConst.CASCADE, StatsSetupConst.TRUE);
@@ -910,6 +931,14 @@ public class Hive {
     } catch (TException e) {
       throw new HiveException("Unable to alter table. " + e.getMessage(), e);
     }
+  }
+
+  private static boolean isRename(EnvironmentContext environmentContext) {
+    if (environmentContext.isSetProperties()) {
+      String operation = environmentContext.getProperties().get(HiveMetaHook.ALTER_TABLE_OPERATION_TYPE);
+      return operation != null && AlterTableType.RENAME == AlterTableType.valueOf(operation);
+    }
+    return false;
   }
 
   /**
@@ -1324,14 +1353,27 @@ public class Hive {
         }
       }
 
-      if (primaryKeys == null && foreignKeys == null
-              && uniqueConstraints == null && notNullConstraints == null && defaultConstraints == null
-          && checkConstraints == null) {
-        getMSC().createTable(tTbl);
-      } else {
-        getMSC().createTableWithConstraints(tTbl, primaryKeys, foreignKeys,
-            uniqueConstraints, notNullConstraints, defaultConstraints, checkConstraints);
+      CreateTableRequest request = new CreateTableRequest(tTbl);
+
+      if (isIcebergTable(tbl)) {
+        EnvironmentContext envContext = new EnvironmentContext();
+        if (TableType.MANAGED_TABLE.equals(tbl.getTableType())) {
+          envContext.putToProperties(CTAS_LEGACY_CONFIG, Boolean.TRUE.toString());
+        }
+        if (isIcebergStatsSource(conf)) {
+          envContext.putToProperties(StatsSetupConst.DO_NOT_UPDATE_STATS, StatsSetupConst.TRUE);
+        }
+        request.setEnvContext(envContext);
       }
+
+      request.setPrimaryKeys(primaryKeys);
+      request.setForeignKeys(foreignKeys);
+      request.setUniqueConstraints(uniqueConstraints);
+      request.setNotNullConstraints(notNullConstraints);
+      request.setDefaultConstraints(defaultConstraints);
+      request.setCheckConstraints(checkConstraints);
+
+      getMSC().createTable(request);
 
     } catch (AlreadyExistsException e) {
       if (!ifNotExists) {
@@ -1486,7 +1528,7 @@ public class Hive {
 
       // TODO: APIs with catalog names
       List<String> partNames = ((null == partSpec)
-        ? null : getPartitionNames(table.getDbName(), table.getTableName(), partSpec, (short) -1));
+              ? null : getPartitionNames(table.getDbName(), table.getTableName(), partSpec, (short) -1));
       if (snapshot == null) {
         getMSC().truncateTable(table.getDbName(), table.getTableName(), partNames);
       } else {
@@ -1567,7 +1609,7 @@ public class Hive {
    */
   public Table getTable(TableName tableName) throws HiveException {
     return this.getTable(ObjectUtils.firstNonNull(tableName.getDb(), SessionState.get().getCurrentDatabase()),
-        tableName.getTable(), null, true);
+        tableName.getTable(), tableName.getTableMetaRef(), true);
   }
 
   /**
@@ -1577,16 +1619,16 @@ public class Hive {
    *          the name of the database
    * @param tableName
    *          the name of the table
-   * @param metaTableName
-   *          the name of the metadata table
+   * @param tableMetaRef
+   *          the name of the table meta ref, e.g. iceberg metadata table or branch
    * @param throwException
    *          controls whether an exception is thrown or a returns a null
    * @return the table or if throwException is false a null value.
    * @throws HiveException
    */
   public Table getTable(final String dbName, final String tableName,
-                        final String metaTableName, boolean throwException) throws HiveException {
-    return this.getTable(dbName, tableName, metaTableName, throwException, false);
+                        final String tableMetaRef, boolean throwException) throws HiveException {
+    return this.getTable(dbName, tableName, tableMetaRef, throwException, false);
   }
 
   /**
@@ -1632,8 +1674,8 @@ public class Hive {
    *          the name of the database
    * @param tableName
    *          the name of the table
-   * @param metaTableName
-   *          the name of the metadata table
+   * @param tableMetaRef
+   *          the name of the table meta ref, e.g. iceberg metadata table or branch
    * @param throwException
    *          controls whether an exception is thrown or a returns a null
    * @param checkTransactional
@@ -1642,9 +1684,9 @@ public class Hive {
    * @return the table or if throwException is false a null value.
    * @throws HiveException
    */
-  public Table getTable(final String dbName, final String tableName, String metaTableName, boolean throwException,
+  public Table getTable(final String dbName, final String tableName, String tableMetaRef, boolean throwException,
                         boolean checkTransactional) throws HiveException {
-    return getTable(dbName, tableName, metaTableName, throwException, checkTransactional, false);
+    return getTable(dbName, tableName, tableMetaRef, throwException, checkTransactional, false);
   }
 
   /**
@@ -1654,8 +1696,8 @@ public class Hive {
    *          the name of the database
    * @param tableName
    *          the name of the table
-   * @param metaTableName
-   *          the name of the metadata table
+   * @param tableMetaRef
+   *          the name of the table meta ref, e.g. iceberg metadata table or branch
    * @param throwException
    *          controls whether an exception is thrown or a returns a null
    * @param checkTransactional
@@ -1666,7 +1708,7 @@ public class Hive {
    * @return the table or if throwException is false a null value.
    * @throws HiveException
    */
-  public Table getTable(final String dbName, final String tableName, String metaTableName, boolean throwException,
+  public Table getTable(final String dbName, final String tableName, String tableMetaRef, boolean throwException,
                         boolean checkTransactional, boolean getColumnStats) throws HiveException {
 
     if (tableName == null || tableName.equals("")) {
@@ -1729,15 +1771,12 @@ public class Hive {
     }
 
     Table t = new Table(tTable);
-    if (metaTableName != null) {
-      if (t.getStorageHandler() == null || !t.getStorageHandler().isMetadataTableSupported()) {
-        throw new SemanticException(ErrorMsg.METADATA_TABLE_NOT_SUPPORTED, t.getTableName());
+    if (tableMetaRef != null) {
+      if (t.getStorageHandler() == null || !t.getStorageHandler().isTableMetaRefSupported()) {
+        throw new SemanticException(ErrorMsg.TABLE_META_REF_NOT_SUPPORTED, t.getTableName());
       }
-      if (!t.getStorageHandler().isValidMetadataTable(metaTableName)) {
-        throw new SemanticException(ErrorMsg.INVALID_METADATA_TABLE_NAME, metaTableName);
-      }
+      t = t.getStorageHandler().checkAndSetTableMetaRef(t, tableMetaRef);
     }
-    t.setMetaTable(metaTableName);
     return t;
   }
 
@@ -1752,9 +1791,14 @@ public class Hive {
    */
   private ValidWriteIdList getValidWriteIdList(String dbName, String tableName) throws LockException {
     ValidWriteIdList validWriteIdList = null;
-    long txnId = SessionState.get() != null && SessionState.get().getTxnMgr() != null ? SessionState.get().getTxnMgr().getCurrentTxnId() : 0;
+    SessionState sessionState = SessionState.get();
+    HiveTxnManager txnMgr = sessionState != null? sessionState.getTxnMgr() : null;
+    long txnId = txnMgr != null ? txnMgr.getCurrentTxnId() : 0;
     if (txnId > 0) {
       validWriteIdList = AcidUtils.getTableValidWriteIdListWithTxnList(conf, dbName, tableName);
+    } else {
+      String fullTableName = getFullTableName(dbName, tableName);
+      validWriteIdList = new ValidReaderWriteIdList(fullTableName, new long[0], new BitSet(), Long.MAX_VALUE);
     }
     return validWriteIdList;
   }
@@ -2023,9 +2067,7 @@ public class Hive {
    * (false), or it cannot be determined (null). The latest case may happen e.g. when the
    * materialized view definition uses external tables.
    */
-  public Boolean isOutdatedMaterializedView(HiveTxnManager txnManager, TableName tableName) throws HiveException {
-
-    Table table = getTable(tableName.getDb(), tableName.getTable());
+  public Boolean isOutdatedMaterializedView(HiveTxnManager txnManager, Table table) throws HiveException {
 
     String validTxnsList = conf.get(ValidTxnList.VALID_TXNS_KEY);
     if (validTxnsList == null) {
@@ -2079,8 +2121,7 @@ public class Hive {
             } else {
               // Obtain additional information if we should try incremental rewriting / rebuild
               // We will not try partial rewriting if there were update/delete/compaction operations on source tables
-              Materialization invalidationInfo = getMSC().getMaterializationInvalidationInfo(
-                  materializedViewTable.getMVMetadata().creationMetadata, conf.get(ValidTxnList.VALID_TXNS_KEY));
+              Materialization invalidationInfo = getMaterializationInvalidationInfo(materializedViewTable.getMVMetadata());
               if (invalidationInfo == null || invalidationInfo.isSourceTablesUpdateDeleteModified() ||
                   invalidationInfo.isSourceTablesCompacted()) {
                 // We ignore (as it did not meet the requirements), but we do not need to update it in the
@@ -2098,6 +2139,55 @@ public class Hive {
     } catch (Exception e) {
       throw new HiveException(e);
     }
+  }
+
+  private Materialization getMaterializationInvalidationInfo(MaterializedViewMetadata metadata)
+      throws TException, HiveException {
+    Optional<SourceTable> first = metadata.getSourceTables().stream().findFirst();
+    if (!first.isPresent()) {
+      // This is unexpected: all MV must have at least one source
+      Materialization materialization = new Materialization();
+      materialization.setSourceTablesCompacted(true);
+      materialization.setSourceTablesUpdateDeleteModified(true);
+      return new Materialization();
+    } else {
+      Table table = getTable(first.get().getTable().getDbName(), first.get().getTable().getTableName());
+      if (!(table.isNonNative() && table.getStorageHandler().areSnapshotsSupported())) {
+        // Mixing native and non-native acid source tables are not supported. If the first source is native acid
+        // the rest is expected to be native acid
+        return getMSC().getMaterializationInvalidationInfo(
+                metadata.creationMetadata, conf.get(ValidTxnList.VALID_TXNS_KEY));
+      }
+    }
+
+    MaterializationSnapshot mvSnapshot = MaterializationSnapshot.fromJson(metadata.creationMetadata.getValidTxnList());
+
+    boolean hasAppendsOnly = true;
+    for (SourceTable sourceTable : metadata.getSourceTables()) {
+      Table table = getTable(sourceTable.getTable().getDbName(), sourceTable.getTable().getTableName());
+      HiveStorageHandler storageHandler = table.getStorageHandler();
+      if (storageHandler == null) {
+        Materialization materialization = new Materialization();
+        materialization.setSourceTablesCompacted(true);
+        return materialization;
+      }
+      Boolean b = storageHandler.hasAppendsOnly(
+          table, mvSnapshot.getTableSnapshots().get(table.getFullyQualifiedName()));
+      if (b == null) {
+        Materialization materialization = new Materialization();
+        materialization.setSourceTablesCompacted(true);
+        return materialization;
+      } else if (!b) {
+        hasAppendsOnly = false;
+        break;
+      }
+    }
+    Materialization materialization = new Materialization();
+    // TODO: delete operations are not supported yet.
+    // Set setSourceTablesCompacted to false when delete is supported
+    materialization.setSourceTablesCompacted(!hasAppendsOnly);
+    materialization.setSourceTablesUpdateDeleteModified(!hasAppendsOnly);
+    return materialization;
   }
 
   /**
@@ -2177,8 +2267,7 @@ public class Hive {
           } else {
             // Obtain additional information if we should try incremental rewriting / rebuild
             // We will not try partial rewriting if there were update/delete/compaction operations on source tables
-            invalidationInfo = getMSC().getMaterializationInvalidationInfo(
-                    metadata.creationMetadata, conf.get(ValidTxnList.VALID_TXNS_KEY));
+            invalidationInfo = getMaterializationInvalidationInfo(metadata);
             ignore = invalidationInfo == null || invalidationInfo.isSourceTablesCompacted();
           }
           if (ignore) {
@@ -2928,10 +3017,10 @@ public class Hive {
   }
 
   private void setStatsPropAndAlterPartitions(boolean resetStatistics, Table tbl,
-                                             List<Partition> partitions,
+                                              List<Partition> partitions,
                                               AcidUtils.TableSnapshot tableSnapshot)
           throws TException {
-    if (partitions.isEmpty()) {
+    if (partitions.isEmpty() || conf.getBoolVar(ConfVars.HIVESTATSAUTOGATHER)) {
       return;
     }
     EnvironmentContext ec = new EnvironmentContext();
@@ -3322,6 +3411,10 @@ private void constructOneLBLocationMap(FileStatus fSta,
           get(conf).getSynchronizedMSC().addWriteNotificationLog(request);
         }
         supported = false;
+      } else {
+	// Rethrow the exception, so failures are visible. Missing a write notification can be very difficult
+	// to debug otherwise.
+	throw e;
       }
     }
     long end = System.currentTimeMillis();
@@ -3597,8 +3690,9 @@ private void constructOneLBLocationMap(FileStatus fSta,
     }
     org.apache.hadoop.hive.metastore.api.Partition tpart = null;
     try {
+      String userName = getUserName();
       tpart = getSynchronizedMSC().getPartitionWithAuthInfo(tbl.getDbName(),
-          tbl.getTableName(), pvals, getUserName(), getGroupNames());
+          tbl.getTableName(), pvals, userName, getGroupNames());
     } catch (NoSuchObjectException nsoe) {
       // this means no partition exists for the given partition
       // key value pairs - thrift cannot handle null return values, hence
@@ -3617,8 +3711,9 @@ private void constructOneLBLocationMap(FileStatus fSta,
             tpart = getSynchronizedMSC().appendPartition(tbl.getDbName(), tbl.getTableName(), pvals);
           } catch (AlreadyExistsException aee) {
             LOG.debug("Caught already exists exception, trying to alter partition instead");
+            String userName = getUserName();
             tpart = getSynchronizedMSC().getPartitionWithAuthInfo(tbl.getDbName(),
-              tbl.getTableName(), pvals, getUserName(), getGroupNames());
+              tbl.getTableName(), pvals, userName, getGroupNames());
             alterPartitionSpec(tbl, partSpec, tpart, inheritTableSpecs, partPath);
           } catch (Exception e) {
             if (CheckJDOException.isJDODataStoreException(e)) {
@@ -3626,8 +3721,9 @@ private void constructOneLBLocationMap(FileStatus fSta,
               // have to be used here. This helps avoid adding jdo dependency for
               // hcatalog client uses
               LOG.debug("Caught JDO exception, trying to alter partition instead");
+              String userName = getUserName();
               tpart = getSynchronizedMSC().getPartitionWithAuthInfo(tbl.getDbName(),
-                tbl.getTableName(), pvals, getUserName(), getGroupNames());
+                tbl.getTableName(), pvals, userName, getGroupNames());
               if (tpart == null) {
                 // This means the exception was caused by something other than a race condition
                 // in creating the partition, since the partition still doesn't exist.
@@ -3742,6 +3838,47 @@ private void constructOneLBLocationMap(FileStatus fSta,
       get(conf).getSynchronizedMSC().addWriteNotificationLog(rqst);
     } else {
       requestList.add(rqst);
+    }
+  }
+
+  /**
+   * This method helps callers trigger an INSERT event for DML queries without having to deal with
+   * HMS objects. This takes java object types as arguments.
+   * @param dbName Name of the hive database this table belongs to.
+   * @param tblName Name of the hive table this event is for.
+   * @param partitionSpec Map containing key/values for each partition column. Can be null if the event is for a table
+   * @param replace boolean to indicate whether the filelist is replacement of existing files. Treated as additions otherwise
+   * @param newFiles List of file paths affected (added/replaced) by this DML query. Can be null
+   * @throws HiveException if the table or partition does not exist or other internal errors in fetching them
+   */
+  public void fireInsertEvent(String dbName, String tblName,
+      Map<String, String> partitionSpec, boolean replace, List<String> newFiles)
+      throws HiveException {
+    if (!conf.getBoolVar(ConfVars.FIRE_EVENTS_FOR_DML)) {
+      LOG.info("DML Events not enabled. Set " + ConfVars.FIRE_EVENTS_FOR_DML.varname);
+      return;
+    }
+    Table table = getTable(dbName, tblName);
+    if (table != null && !table.isTemporary()) {
+      List<FileStatus> newFileStatusObject = null;
+      String parentDir = null;
+      if (newFiles != null && newFiles.size() > 0) {
+        newFileStatusObject = new ArrayList<>(newFiles.size());
+        if (partitionSpec != null && partitionSpec.size() > 0) {
+          // fetch the partition object to determine its location
+          Partition part = getPartition(table, partitionSpec, false);
+          parentDir = part.getLocation();
+        } else {
+          // fetch the table location
+          parentDir = table.getSd().getLocation();
+        }
+        for (String fileName: newFiles) {
+          FileStatus fStatus = new FileStatus();
+          fStatus.setPath(new Path(parentDir, fileName));
+          newFileStatusObject.add(fStatus);
+        }
+      }
+      fireInsertEvent(table, partitionSpec, replace, newFileStatusObject);
     }
   }
 
@@ -3899,6 +4036,9 @@ private void constructOneLBLocationMap(FileStatus fSta,
       Map<String, String> partSpec, short max) throws HiveException {
     List<String> names = null;
     Table t = getTable(dbName, tblName);
+    if (t.getStorageHandler() != null && t.getStorageHandler().alwaysUnpartitioned()) {
+      return t.getStorageHandler().getPartitionNames(t, partSpec);
+    }
 
     List<String> pvals = MetaStoreUtils.getPvals(t.getPartCols(), partSpec);
 
@@ -3992,6 +4132,8 @@ private void constructOneLBLocationMap(FileStatus fSta,
           GetPartitionsPsWithAuthResponse res = getMSC().listPartitionsWithAuthInfoRequest(req);
           tParts = res.getPartitions();
 
+        } catch (NoSuchObjectException nsoe) {
+          return Lists.newArrayList();
         } catch (Exception e) {
           LOG.error("Failed getPartitions", e);
           throw new HiveException(e);
@@ -4015,7 +4157,7 @@ private void constructOneLBLocationMap(FileStatus fSta,
    * @param tbl table for which partitions are needed
    * @return list of partition objects
    */
-  public Set<Partition> getAllPartitionsOf(Table tbl) throws HiveException {
+  public Set<Partition> getAllPartitions(Table tbl) throws HiveException {
     if (!tbl.isPartitioned()) {
       return Sets.newHashSet(new Partition(tbl));
     }
@@ -4032,6 +4174,49 @@ private void constructOneLBLocationMap(FileStatus fSta,
       parts.add(new Partition(tbl, tpart));
     }
     return parts;
+  }
+
+  /**
+   * Get all the partitions. Do it in batches if batchSize is more than 0 else get it in one call.
+   * @param tbl table for which partitions are needed
+   * @return list of partition objects
+   */
+  public Set<Partition> getAllPartitionsOf(Table tbl) throws HiveException {
+    int batchSize= MetastoreConf.getIntVar(
+            Hive.get().getConf(), MetastoreConf.ConfVars.BATCH_RETRIEVE_MAX);
+    if (batchSize > 0) {
+      return getAllPartitionsInBatches(tbl, batchSize, DEFAULT_BATCH_DECAYING_FACTOR, MetastoreConf.getIntVar(
+              Hive.get().getConf(), MetastoreConf.ConfVars.GETPARTITIONS_BATCH_MAX_RETRIES));
+    } else {
+      return getAllPartitions(tbl);
+    }
+  }
+
+  public Set<Partition> getAllPartitionsInBatches(Table tbl, int batchSize, int decayingFactor,
+         int maxRetries) throws HiveException {
+    if (!tbl.isPartitioned()) {
+      return Sets.newHashSet(new Partition(tbl));
+    }
+    Set<Partition> result = new LinkedHashSet<>();
+    RetryUtilities.ExponentiallyDecayingBatchWork batchTask = new RetryUtilities
+            .ExponentiallyDecayingBatchWork<Void>(batchSize, decayingFactor, maxRetries) {
+      @Override
+      public Void execute(int size) throws HiveException {
+        try {
+          result.clear();
+          new PartitionIterable(Hive.get(), tbl, null, size).forEach(result::add);
+          return null;
+        } catch (HiveException e) {
+          throw e;
+        }
+      }
+    };
+    try {
+      batchTask.run();
+    } catch (Exception e) {
+      throw new HiveException(e);
+    }
+    return result;
   }
 
   /**
@@ -4059,8 +4244,9 @@ private void constructOneLBLocationMap(FileStatus fSta,
 
       List<org.apache.hadoop.hive.metastore.api.Partition> partitions = null;
       try {
+        String userName = getUserName();
         partitions = getMSC().listPartitionsWithAuthInfo(tbl.getDbName(), tbl.getTableName(),
-                partialPvals, limit, getUserName(), getGroupNames());
+                partialPvals, limit, userName, getGroupNames());
       } catch (Exception e) {
         throw new HiveException(e);
       }
@@ -4305,25 +4491,30 @@ private void constructOneLBLocationMap(FileStatus fSta,
     perfLogger.perfLogBegin(CLASS_NAME, PerfLogger.HIVE_GET_PARTITIONS_BY_EXPR);
     try {
       Preconditions.checkNotNull(partitions);
-      byte[] exprBytes = SerializationUtilities.serializeObjectWithTypeInformation(expr);
       String defaultPartitionName = HiveConf.getVar(conf, ConfVars.DEFAULTPARTITIONNAME);
-      List<org.apache.hadoop.hive.metastore.api.PartitionSpec> msParts =
-              new ArrayList<>();
-      ValidWriteIdList validWriteIdList = null;
+      if (tbl.getStorageHandler() != null && tbl.getStorageHandler().alwaysUnpartitioned()) {
+        partitions.addAll(tbl.getStorageHandler().getPartitionsByExpr(tbl, expr));
+        return false;
+      } else {
+        byte[] exprBytes = SerializationUtilities.serializeObjectWithTypeInformation(expr);
+        List<org.apache.hadoop.hive.metastore.api.PartitionSpec> msParts =
+                new ArrayList<>();
+        ValidWriteIdList validWriteIdList = null;
 
-      PartitionsByExprRequest req = buildPartitionByExprRequest(tbl, exprBytes, defaultPartitionName, conf,
-              null);
+        PartitionsByExprRequest req = buildPartitionByExprRequest(tbl, exprBytes, defaultPartitionName, conf,
+                null);
 
-      if (AcidUtils.isTransactionalTable(tbl)) {
-        validWriteIdList = getValidWriteIdList(tbl.getDbName(), tbl.getTableName());
-        req.setValidWriteIdList(validWriteIdList != null ? validWriteIdList.toString() : null);
-        req.setId(tbl.getTTable().getId());
+        if (AcidUtils.isTransactionalTable(tbl)) {
+          validWriteIdList = getValidWriteIdList(tbl.getDbName(), tbl.getTableName());
+          req.setValidWriteIdList(validWriteIdList != null ? validWriteIdList.toString() : null);
+          req.setId(tbl.getTTable().getId());
+        }
+
+        boolean hasUnknownParts = getMSC().listPartitionsSpecByExpr(req, msParts);
+        partitions.addAll(convertFromPartSpec(msParts.iterator(), tbl));
+
+        return hasUnknownParts;
       }
-
-      boolean hasUnknownParts = getMSC().listPartitionsSpecByExpr(req, msParts);
-      partitions.addAll(convertFromPartSpec(msParts.iterator(), tbl));
-
-      return hasUnknownParts;
     } finally {
       perfLogger.perfLogEnd(CLASS_NAME, PerfLogger.HIVE_GET_PARTITIONS_BY_EXPR, "HS2-cache");
     }
@@ -4650,7 +4841,6 @@ private void constructOneLBLocationMap(FileStatus fSta,
       return false;
     }
 
-    LOG.debug("The source path is " + fullF1 + " and the destination path is " + fullF2);
     return fullF1.startsWith(fullF2);
   }
 
@@ -4733,7 +4923,8 @@ private void constructOneLBLocationMap(FileStatus fSta,
       if (!FileUtils.copy(sourceFs, sourcePath, destFs, destFilePath,
           false,   // delete source
           false,  // overwrite destination
-          conf)) {
+          conf,
+          new DataCopyStatistics())) {
         LOG.error("Copy failed for source: " + sourcePath + " to destination: " + destFilePath);
         throw new IOException("File copy failed.");
       }
@@ -4865,7 +5056,8 @@ private void constructOneLBLocationMap(FileStatus fSta,
           return FileUtils.copy(srcf.getFileSystem(conf), srcf, destf.getFileSystem(conf), destf,
               true,    // delete source
               replace, // overwrite destination
-              conf);
+              conf,
+              new DataCopyStatistics());
         } else {
           if (srcIsSubDirOfDest || destIsSubDirOfSrc) {
             FileStatus[] srcs = destFs.listStatus(srcf, FileUtils.HIDDEN_FILES_PATH_FILTER);
@@ -5968,9 +6160,11 @@ private void constructOneLBLocationMap(FileStatus fSta,
     }
   }
 
-  public void abortTransactions(List<Long> txnids) throws HiveException {
+  public void abortTransactions(List<Long> txnids, long errorCode) throws HiveException {
+    AbortTxnsRequest abortTxnsRequest = new AbortTxnsRequest(txnids);
+    abortTxnsRequest.setErrorCode(errorCode);
     try {
-      getMSC().abortTxns(txnids);
+      getMSC().abortTxns(abortTxnsRequest);
     } catch (Exception e) {
       LOG.error("Failed abortTransactions", e);
       throw new HiveException(e);
@@ -6612,9 +6806,28 @@ private void constructOneLBLocationMap(FileStatus fSta,
 
   public void alterTableExecuteOperation(Table table, AlterTableExecuteSpec executeSpec) throws HiveException {
     try {
-      HiveStorageHandler storageHandler = createStorageHandler(table.getTTable());
+      HiveStorageHandler storageHandler = Optional.ofNullable(createStorageHandler(table.getTTable())).orElseThrow(() ->
+          new UnsupportedOperationException(String.format("ALTER EXECUTE is not supported for table %s", table.getTableName())));
       storageHandler.executeOperation(table, executeSpec);
     } catch (MetaException e) {
+      throw new HiveException(e);
+    }
+  }
+
+  public void alterTableSnapshotRefOperation(Table table, AlterTableSnapshotRefSpec alterTableSnapshotRefSpec) throws HiveException {
+    try {
+      HiveStorageHandler storageHandler = createStorageHandler(table.getTTable());
+      storageHandler.alterTableSnapshotRefOperation(table, alterTableSnapshotRefSpec);
+    } catch (Exception e) {
+      throw new HiveException(e);
+    }
+  }
+
+  public AbortCompactResponse abortCompactions(AbortCompactionRequest request) throws HiveException {
+    try {
+      return getMSC().abortCompactions(request);
+    } catch (Exception e) {
+      LOG.error("Failed abortCompactions", e);
       throw new HiveException(e);
     }
   }

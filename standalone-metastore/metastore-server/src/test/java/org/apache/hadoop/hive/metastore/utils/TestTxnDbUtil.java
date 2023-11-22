@@ -216,6 +216,7 @@ public final class TestTxnDbUtil {
       // We want to try these, whether they succeed or fail.
       success &= truncateTable(conn, conf, stmt, "TXN_COMPONENTS");
       success &= truncateTable(conn, conf, stmt, "COMPLETED_TXN_COMPONENTS");
+      success &= truncateTable(conn, conf, stmt, "MIN_HISTORY_WRITE_ID");
       success &= truncateTable(conn, conf, stmt, "TXNS");
       success &= truncateTable(conn, conf, stmt, "TXN_TO_WRITE_ID");
       success &= truncateTable(conn, conf, stmt, "NEXT_WRITE_ID");
@@ -240,12 +241,12 @@ public final class TestTxnDbUtil {
         } catch (SQLException e) {
           if (!databaseProduct.isTableNotExistsError(e)) {
             LOG.error("Error initializing sequence values", e);
-            success = false;
+            throw e;
           }
         }
       } catch (SQLException e) {
         LOG.error("Unable determine database product ", e);
-        success = false;
+        throw e;
       }
       /*
        * Don't drop NOTIFICATION_LOG, SEQUENCE_TABLE and NOTIFICATION_SEQUENCE as its used by other
@@ -268,27 +269,23 @@ public final class TestTxnDbUtil {
     }
   }
 
-  private static boolean truncateTable(Connection conn, Configuration conf, Statement stmt, String name) {
+  private static boolean truncateTable(Connection conn, Configuration conf, Statement stmt, String name) throws SQLException {
+    String dbProduct = conn.getMetaData().getDatabaseProductName();
+    DatabaseProduct databaseProduct = determineDatabaseProduct(dbProduct, conf);
     try {
-      String dbProduct = conn.getMetaData().getDatabaseProductName();
-      DatabaseProduct databaseProduct = determineDatabaseProduct(dbProduct, conf);
-      try {
-        // We can not use actual truncate due to some foreign keys, but we don't expect much data during tests
+      // We can not use actual truncate due to some foreign keys, but we don't expect much data during tests
 
-        String s = databaseProduct.getTruncateStatement(name);
-        stmt.execute(s);
+      String s = databaseProduct.getTruncateStatement(name);
+      stmt.execute(s);
 
-        LOG.debug("Successfully truncated table " + name);
-        return true;
-      } catch (SQLException e) {
-        if (databaseProduct.isTableNotExistsError(e)) {
-          LOG.debug("Not truncating " + name + " because it doesn't exist");
-          return true;
-        }
-        LOG.error("Unable to truncate table " + name, e);
-      }
+      LOG.debug("Successfully truncated table " + name);
+      return true;
     } catch (SQLException e) {
-      LOG.error("Unable determine database product ", e);
+      if (databaseProduct.isTableNotExistsError(e)) {
+        LOG.debug("Not truncating " + name + " because it doesn't exist");
+        return true;
+      }
+      LOG.error("Unable to truncate table " + name, e);
     }
     return false;
   }

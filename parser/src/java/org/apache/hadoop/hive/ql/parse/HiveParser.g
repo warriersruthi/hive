@@ -219,6 +219,13 @@ TOK_ALTERTABLE_UPDATECOLUMNS;
 TOK_ALTERTABLE_OWNER;
 TOK_ALTERTABLE_SETPARTSPEC;
 TOK_ALTERTABLE_EXECUTE;
+TOK_ALTERTABLE_CREATE_BRANCH;
+TOK_ALTERTABLE_DROP_BRANCH;
+TOK_ALTERTABLE_CREATE_TAG;
+TOK_ALTERTABLE_DROP_TAG;
+TOK_RETAIN;
+TOK_WITH_SNAPSHOT_RETENTION;
+TOK_ALTERTABLE_CONVERT;
 TOK_MSCK;
 TOK_SHOWDATABASES;
 TOK_SHOWDATACONNECTORS;
@@ -431,6 +438,7 @@ TOK_ROLLBACK;
 TOK_SET_AUTOCOMMIT;
 TOK_CACHE_METADATA;
 TOK_ABORT_TRANSACTIONS;
+TOK_ABORT_COMPACTIONS;
 TOK_MERGE;
 TOK_MATCHED;
 TOK_NOT_MATCHED;
@@ -505,6 +513,8 @@ TOK_TRUNCATE;
 TOK_BUCKET;
 TOK_AS_OF_TIME;
 TOK_AS_OF_VERSION;
+TOK_FROM_VERSION;
+TOK_AS_OF_TAG;
 }
 
 
@@ -1092,6 +1102,7 @@ ddlStatement
     | setRole
     | showCurrentRole
     | abortTransactionStatement
+    | abortCompactionStatement
     | killQueryStatement
     | resourcePlanDdlStatements
     | createDataConnectorStatement
@@ -1685,6 +1696,8 @@ viewPartition
 @after { popMsg(state); }
     : KW_PARTITIONED KW_ON LPAREN columnNameList RPAREN
     -> ^(TOK_VIEWPARTCOLS columnNameList)
+    | KW_PARTITIONED KW_ON KW_SPEC LPAREN (spec = partitionTransformSpec) RPAREN
+    -> ^(TOK_TABLEPARTCOLSBYSPEC $spec)
     ;
 
 viewOrganization
@@ -1915,6 +1928,14 @@ tableBuckets
     :
       KW_CLUSTERED KW_BY LPAREN bucketCols=columnNameList RPAREN (KW_SORTED KW_BY LPAREN sortCols=columnNameOrderList RPAREN)? KW_INTO num=Number KW_BUCKETS
     -> ^(TOK_ALTERTABLE_BUCKETS $bucketCols $sortCols? $num)
+    ;
+
+tableImplBuckets
+@init { pushMsg("implicit table buckets specification", state); }
+@after { popMsg(state); }
+    :
+      KW_CLUSTERED KW_INTO num=Number KW_BUCKETS
+    -> ^(TOK_ALTERTABLE_BUCKETS $num)
     ;
 
 tableSkewed
@@ -2888,7 +2909,13 @@ abortTransactionStatement
   KW_ABORT KW_TRANSACTIONS ( Number )+ -> ^(TOK_ABORT_TRANSACTIONS ( Number )+)
   ;
 
+abortCompactionStatement
+@init { pushMsg("abort compactions statement", state); }
+@after { popMsg(state); }
+  :
 
+       KW_ABORT KW_COMPACTIONS ( Number )+ -> ^(TOK_ABORT_COMPACTIONS ( Number )+)
+  ;
 /*
 BEGIN SQL Merge statement
 */

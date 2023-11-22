@@ -45,6 +45,8 @@ import org.apache.hadoop.hive.ql.plan.PlanUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import static org.apache.hadoop.hive.ql.ddl.DDLUtils.setColumnsAndStorePartitionTransformSpecOfTable;
+
 /**
  * DDL task description for CREATE VIEW commands.
  */
@@ -312,17 +314,13 @@ public class CreateMaterializedViewDesc implements DDLDesc, Serializable {
     tbl.setTableType(TableType.MATERIALIZED_VIEW);
     tbl.setSerializationLib(null);
     tbl.clearSerDeInfo();
-    tbl.setFields(getSchema());
+
     if (getComment() != null) {
       tbl.setProperty("comment", getComment());
     }
 
     if (tblProps != null) {
       tbl.getParameters().putAll(tblProps);
-    }
-
-    if (!CollectionUtils.isEmpty(partCols)) {
-      tbl.setPartCols(partCols);
     }
 
     if (!CollectionUtils.isEmpty(sortColNames)) {
@@ -351,7 +349,15 @@ public class CreateMaterializedViewDesc implements DDLDesc, Serializable {
           org.apache.hadoop.hive.metastore.api.hive_metastoreConstants.META_TABLE_STORAGE,
           getStorageHandler());
     }
+    if (getSerdeProps() != null) {
+      for (Map.Entry<String, String> entry : getSerdeProps().entrySet()) {
+        tbl.setSerdeParam(entry.getKey(), entry.getValue());
+      }
+    }
+
     HiveStorageHandler storageHandler = tbl.getStorageHandler();
+
+    setColumnsAndStorePartitionTransformSpecOfTable(getSchema(), getPartCols(), conf, tbl);
 
     /*
      * If the user didn't specify a SerDe, we use the default.

@@ -20,6 +20,11 @@ class ThriftHiveMetastoreHandler : virtual public ThriftHiveMetastoreIf {
     // Your initialization goes here
   }
 
+  void abort_Compactions(AbortCompactResponse& _return, const AbortCompactionRequest& rqst) {
+    // Your implementation goes here
+    printf("abort_Compactions\n");
+  }
+
   void getMetaConf(std::string& _return, const std::string& key) {
     // Your implementation goes here
     printf("getMetaConf\n");
@@ -505,6 +510,11 @@ class ThriftHiveMetastoreHandler : virtual public ThriftHiveMetastoreIf {
     printf("get_partitions_by_filter\n");
   }
 
+  void get_partitions_by_filter_req(std::vector<Partition> & _return, const GetPartitionsByFilterRequest& req) {
+    // Your implementation goes here
+    printf("get_partitions_by_filter_req\n");
+  }
+
   void get_part_specs_by_filter(std::vector<PartitionSpec> & _return, const std::string& db_name, const std::string& tbl_name, const std::string& filter, const int32_t max_parts) {
     // Your implementation goes here
     printf("get_part_specs_by_filter\n");
@@ -533,6 +543,16 @@ class ThriftHiveMetastoreHandler : virtual public ThriftHiveMetastoreIf {
   void get_partitions_by_names_req(GetPartitionsByNamesResult& _return, const GetPartitionsByNamesRequest& req) {
     // Your implementation goes here
     printf("get_partitions_by_names_req\n");
+  }
+
+  void get_properties(PropertyGetResponse& _return, const PropertyGetRequest& req) {
+    // Your implementation goes here
+    printf("get_properties\n");
+  }
+
+  bool set_properties(const PropertySetRequest& req) {
+    // Your implementation goes here
+    printf("set_properties\n");
   }
 
   void alter_partition(const std::string& db_name, const std::string& tbl_name, const Partition& new_part) {
@@ -908,6 +928,11 @@ class ThriftHiveMetastoreHandler : virtual public ThriftHiveMetastoreIf {
   void get_valid_write_ids(GetValidWriteIdsResponse& _return, const GetValidWriteIdsRequest& rqst) {
     // Your implementation goes here
     printf("get_valid_write_ids\n");
+  }
+
+  void add_write_ids_to_min_history(const int64_t txnId, const std::map<std::string, int64_t> & writeIds) {
+    // Your implementation goes here
+    printf("add_write_ids_to_min_history\n");
   }
 
   void allocate_table_write_ids(AllocateTableWriteIdsResponse& _return, const AllocateTableWriteIdsRequest& rqst) {

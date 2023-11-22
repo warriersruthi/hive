@@ -32,7 +32,6 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.io.UncheckedIOException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
@@ -63,8 +62,6 @@ import java.util.Optional;
 import java.util.Properties;
 import java.util.Random;
 import java.util.Set;
-import java.util.Spliterator;
-import java.util.Spliterators;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
@@ -77,8 +74,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
-import java.util.stream.StreamSupport;
 import java.util.zip.Deflater;
 import java.util.zip.DeflaterOutputStream;
 import java.util.zip.InflaterInputStream;
@@ -262,6 +257,7 @@ public final class Utilities {
   public static final String MAPNAME = "Map ";
   public static final String REDUCENAME = "Reducer ";
   public static final String ENSURE_OPERATORS_EXECUTED = "ENSURE_OPERATORS_EXECUTED";
+  public static final String SNAPSHOT_REF = "snapshot_ref";
 
   @Deprecated
   protected static final String DEPRECATED_MAPRED_DFSCLIENT_PARALLELISM_MAX = "mapred.dfsclient.parallelism.max";
@@ -768,6 +764,9 @@ public final class Utilities {
     if (tbl.getMetaTable() != null) {
       props.put("metaTable", tbl.getMetaTable());
     }
+    if (tbl.getSnapshotRef() != null) {
+      props.put(SNAPSHOT_REF, tbl.getSnapshotRef());
+    }
     return (new TableDesc(tbl.getInputFormatClass(), tbl
         .getOutputFormatClass(), props));
   }
@@ -1040,7 +1039,8 @@ public final class Utilities {
     return src;
   }
 
-  private static final String tmpPrefix = "_tmp.";
+  private static final String hadoopTmpPrefix = "_tmp.";
+  private static final String tmpPrefix = "-tmp.";
   private static final String taskTmpPrefix = "_task_tmp.";
 
   public static Path toTaskTempPath(Path orig) {
@@ -1071,7 +1071,7 @@ public final class Utilities {
     String name = file.getPath().getName();
     // in addition to detecting hive temporary files, we also check hadoop
     // temporary folders that used to show up in older releases
-    return (name.startsWith("_task") || name.startsWith(tmpPrefix));
+    return (name.startsWith("_task") || name.startsWith(tmpPrefix) || name.startsWith(hadoopTmpPrefix));
   }
 
   /**
@@ -1394,7 +1394,7 @@ public final class Utilities {
   }
 
 
-  private static boolean shouldAvoidRename(FileSinkDesc conf, Configuration hConf) {
+  public static boolean shouldAvoidRename(FileSinkDesc conf, Configuration hConf) {
     // we are avoiding rename/move only if following conditions are met
     //  * execution engine is tez
     //  * if it is select query
@@ -1416,7 +1416,7 @@ public final class Utilities {
     }
   }
 
-  public static void mvFileToFinalPath(Path specPath, Configuration hconf,
+  public static void mvFileToFinalPath(Path specPath, String unionSuffix, Configuration hconf,
                                        boolean success, Logger log, DynamicPartitionCtx dpCtx, FileSinkDesc conf,
                                        Reporter reporter) throws IOException,
       HiveException {
@@ -1436,6 +1436,9 @@ public final class Utilities {
     FileSystem fs = specPath.getFileSystem(hconf);
     Path tmpPath = Utilities.toTempPath(specPath);
     Path taskTmpPath = Utilities.toTaskTempPath(specPath);
+    if (!StringUtils.isEmpty(unionSuffix)) {
+      specPath = specPath.getParent();
+    }
     PerfLogger perfLogger = SessionState.getPerfLogger();
     boolean isBlobStorage = BlobStorageUtils.isBlobStorageFileSystem(hconf, fs);
     boolean avoidRename = false;
@@ -1466,8 +1469,10 @@ public final class Utilities {
         Set<FileStatus> filesKept = new HashSet<>();
         perfLogger.perfLogBegin("FileSinkOperator", "RemoveTempOrDuplicateFiles");
         // remove any tmp file or double-committed output files
-        List<Path> emptyBuckets = Utilities.removeTempOrDuplicateFiles(
-            fs, statuses, dpCtx, conf, hconf, filesKept, false);
+        int dpLevels = dpCtx == null ? 0 : dpCtx.getNumDPCols(),
+            numBuckets = (conf != null && conf.getTable() != null) ? conf.getTable().getNumBuckets() : 0;
+        List<Path> emptyBuckets = removeTempOrDuplicateFiles(
+            fs, statuses, unionSuffix, dpLevels, numBuckets, hconf, null, 0, false, filesKept, false);
         perfLogger.perfLogEnd("FileSinkOperator", "RemoveTempOrDuplicateFiles");
         // create empty buckets if necessary
         if (!emptyBuckets.isEmpty()) {
@@ -1814,15 +1819,14 @@ public final class Utilities {
           if (!path.getName().equals(AcidUtils.baseOrDeltaSubdir(isBaseDir, writeId, writeId, stmtId))) {
             throw new IOException("Unexpected non-MM directory name " + path);
           }
+        }
 
-          Utilities.FILE_OP_LOGGER.trace("removeTempOrDuplicateFiles processing files in MM directory {}", path);
-
-          if (!StringUtils.isEmpty(unionSuffix)) {
-            try {
-              items = fs.listStatus(new Path(path, unionSuffix));
-            } catch (FileNotFoundException e) {
-              continue;
-            }
+        Utilities.FILE_OP_LOGGER.trace("removeTempOrDuplicateFiles processing files in directory {}", path);
+        if (!StringUtils.isEmpty(unionSuffix)) {
+          try {
+            items = fs.listStatus(new Path(path, unionSuffix));
+          } catch (FileNotFoundException e) {
+            continue;
           }
         }
 
@@ -3521,6 +3525,9 @@ public final class Utilities {
     Set<Path> pathsProcessed = new HashSet<Path>();
     List<Path> pathsToAdd = new LinkedList<Path>();
     DriverState driverState = DriverState.getDriverState();
+    if (work.isUseInputPathsDirectly() && work.getInputPaths() != null) {
+      return work.getInputPaths();
+    }
     // AliasToWork contains all the aliases
     Collection<String> aliasToWork = work.getAliasToWork().keySet();
     if (!skipDummy) {
@@ -4552,7 +4559,7 @@ public final class Utilities {
     if (isDelete) {
       deltaDir = AcidUtils.deleteDeltaSubdir(writeId, writeId, stmtId);
     }
-    Path manifestPath = new Path(manifestRoot, "_tmp." + deltaDir);
+    Path manifestPath = new Path(manifestRoot, Utilities.toTempPath(deltaDir));
 
     if (isInsertOverwrite) {
       // When doing a multi-statement insert overwrite query with dynamic partitioning, the

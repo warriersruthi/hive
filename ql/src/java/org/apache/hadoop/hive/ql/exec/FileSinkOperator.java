@@ -550,6 +550,8 @@ public class FileSinkOperator extends TerminalOperator<FileSinkDesc> implements
   protected boolean filesCreated = false;
   protected BitSet filesCreatedPerBucket = new BitSet();
 
+  protected boolean isCompactionTable = false;
+
   private void initializeSpecPath() {
     // For a query of the type:
     // insert overwrite table T1
@@ -576,7 +578,17 @@ public class FileSinkOperator extends TerminalOperator<FileSinkDesc> implements
         unionPath = null;
       } else if (conf.isMmTable() || isUnionDp) {
         // MM tables need custom handling for union suffix; DP tables use parent too.
-        specPath = conf.getParentDir();
+        // For !isDirectInsert and !conf.isMmTable() cases, the output will be like:
+        // w1: <table-dir>/<staging-dir>/_tmp.-ext-10000/<partition-dir>/HIVE_UNION_SUBDIR_1/<task_id>
+        // w2: <table-dir>/<staging-dir>/_tmp.-ext-10000/<partition-dir>/HIVE_UNION_SUBDIR_2/<task_id>
+        // When the BaseWork w2 in a TezTask closes first, it may rename the entire directory:
+        // <table-dir>/<staging-dir>/_tmp.-ext-10000 to <table-dir>/<staging-dir>/_tmp.-ext-10000.moved,
+        // make the specPath to conf.getDirName() can give w1 a chance to deal with his output under the
+        // directory HIVE_UNION_SUBDIR_1, the output directory after will be
+        // <table-dir>/<staging-dir>/-ext-10000/_tmp.HIVE_UNION_SUBDIR_1/<partition-dir>/HIVE_UNION_SUBDIR_1.
+        // When the job finishes, it will move the output to
+        // <table-dir>/<staging-dir>/-ext-10000/<partition-dir>/HIVE_UNION_SUBDIR_1 as it does before.
+        specPath = conf.isMmTable() ? conf.getParentDir() : conf.getDirName();
         unionPath = conf.getDirName().getName();
       } else {
         // For now, keep the old logic for non-MM non-DP union case. Should probably be unified.
@@ -608,6 +620,7 @@ public class FileSinkOperator extends TerminalOperator<FileSinkDesc> implements
       isTemporary = conf.isTemporary();
       multiFileSpray = conf.isMultiFileSpray();
       this.isBucketed = hconf.getInt(hive_metastoreConstants.BUCKET_COUNT, 0) > 0;
+      this.isCompactionTable = conf.isCompactionTable();
       totalFiles = conf.getTotalFiles();
       numFiles = conf.getNumFiles();
       dpCtx = conf.getDynPartCtx();
@@ -898,7 +911,7 @@ public class FileSinkOperator extends TerminalOperator<FileSinkDesc> implements
   protected void createBucketForFileIdx(FSPaths fsp, int filesIdx)
       throws HiveException {
     try {
-      if (conf.isCompactionTable()) {
+      if (isCompactionTable) {
         fsp.initializeBucketPaths(filesIdx, AcidUtils.BUCKET_PREFIX + String.format(AcidUtils.BUCKET_DIGITS, bucketId),
             isNativeTable(), isSkewedStoredAsSubDirectories);
       } else {
@@ -924,7 +937,7 @@ public class FileSinkOperator extends TerminalOperator<FileSinkDesc> implements
       //todo IOW integration. Full Acid uses the else if block to create Acid's RecordUpdater (HiveFileFormatUtils)
       // and that will set writingBase(conf.getInsertOverwrite())
       // If MM wants to create a new base for IOW (instead of delta dir), it should specify it here
-      if (conf.getWriteType() == AcidUtils.Operation.NOT_ACID || conf.isMmTable() || conf.isCompactionTable()) {
+      if (conf.getWriteType() == AcidUtils.Operation.NOT_ACID || conf.isMmTable() || isCompactionTable) {
         Path outPath = fsp.outPaths[filesIdx];
         if (conf.isMmTable()
             && !FileUtils.mkdir(fs, outPath.getParent(), hconf)) {
@@ -1050,12 +1063,12 @@ public class FileSinkOperator extends TerminalOperator<FileSinkDesc> implements
     String lbDirName = null;
     lbDirName = (lbCtx == null) ? null : generateListBucketingDirName(row);
 
-    if (!bDynParts && (!filesCreated || conf.isCompactionTable())) {
+    if (!bDynParts && (!filesCreated || isCompactionTable)) {
       if (lbDirName != null) {
         if (valToPaths.get(lbDirName) == null) {
           createNewPaths(null, lbDirName);
         }
-      } else if (conf.isCompactionTable()) {
+      } else if (isCompactionTable) {
         if (conf.isRebalanceRequested()) {
           //For rebalancing compaction, the unencoded bucket id comes in the bucketproperty. It must be encoded before
           //writing the data out
@@ -1133,8 +1146,8 @@ public class FileSinkOperator extends TerminalOperator<FileSinkDesc> implements
       }
 
       rowOutWriters = fpaths.outWriters;
-      // check if all record writers implement statistics. if atleast one RW
-      // doesn't implement stats interface we will fallback to conventional way
+      // check if all record writers implement statistics. if at least one RW
+      // doesn't implement stats interface we will fall back to conventional way
       // of gathering stats
       isCollectRWStats = areAllTrue(statsFromRecordWriter);
       if (conf.isGatherStats() && !isCollectRWStats) {
@@ -1160,9 +1173,9 @@ public class FileSinkOperator extends TerminalOperator<FileSinkDesc> implements
       // for a given operator branch prediction should work quite nicely on it.
       // RecordUpdater expects to get the actual row, not a serialized version of it.  Thus we
       // pass the row rather than recordValue.
-      if (conf.getWriteType() == AcidUtils.Operation.NOT_ACID || conf.isMmTable() || conf.isCompactionTable()) {
+      if (conf.getWriteType() == AcidUtils.Operation.NOT_ACID || conf.isMmTable() || isCompactionTable) {
         writerOffset = bucketId;
-        if (!conf.isCompactionTable()) {
+        if (!isCompactionTable) {
           writerOffset = findWriterOffset(row);
         }
         rowOutWriters[writerOffset].write(recordValue);
@@ -1245,7 +1258,7 @@ public class FileSinkOperator extends TerminalOperator<FileSinkDesc> implements
   protected boolean areAllTrue(boolean[] statsFromRW) {
     // If we are doing an acid operation they will always all be true as RecordUpdaters always
     // collect stats
-    if (conf.getWriteType() != AcidUtils.Operation.NOT_ACID && !conf.isMmTable() && !conf.isCompactionTable()) {
+    if (conf.getWriteType() != AcidUtils.Operation.NOT_ACID && !conf.isMmTable() && !isCompactionTable) {
       return true;
     }
     for(boolean b : statsFromRW) {
@@ -1505,7 +1518,7 @@ public class FileSinkOperator extends TerminalOperator<FileSinkDesc> implements
         // record writer already gathers the statistics, it can simply return the
         // accumulated statistics which will be aggregated in case of spray writers
         if (conf.isGatherStats() && isCollectRWStats) {
-          if (conf.getWriteType() == AcidUtils.Operation.NOT_ACID || conf.isMmTable() || conf.isCompactionTable()) {
+          if (conf.getWriteType() == AcidUtils.Operation.NOT_ACID || conf.isMmTable() || isCompactionTable) {
             for (int idx = 0; idx < fsp.outWriters.length; idx++) {
               RecordWriter outWriter = fsp.outWriters[idx];
               if (outWriter != null) {
@@ -1582,7 +1595,7 @@ public class FileSinkOperator extends TerminalOperator<FileSinkDesc> implements
         DynamicPartitionCtx dpCtx = conf.getDynPartCtx();
         ListBucketingCtx lbCtx = conf.getLbCtx();
         if (conf.isLinkedFileSink() && (dpCtx != null || conf.isMmTable())) {
-          specPath = conf.getParentDir();
+          specPath = conf.isMmTable() ? conf.getParentDir() : conf.getDirName();
           unionSuffix = conf.getDirName().getName();
         }
         if (conf.isLinkedFileSink() && conf.isDirectInsert()) {
@@ -1593,7 +1606,7 @@ public class FileSinkOperator extends TerminalOperator<FileSinkDesc> implements
           Utilities.FILE_OP_LOGGER.trace("jobCloseOp using specPath " + specPath);
         }
         if (!conf.isMmTable() && !conf.isDirectInsert()) {
-          Utilities.mvFileToFinalPath(specPath, hconf, success, LOG, dpCtx, conf, reporter);
+          Utilities.mvFileToFinalPath(specPath, unionSuffix, hconf, success, LOG, dpCtx, conf, reporter);
         } else {
           int dpLevels = dpCtx == null ? 0 : dpCtx.getNumDPCols(),
               lbLevels = lbCtx == null ? 0 : lbCtx.calculateListBucketingLevel();
@@ -1634,7 +1647,7 @@ public class FileSinkOperator extends TerminalOperator<FileSinkDesc> implements
       }
     }
     if (conf.getTableInfo().isNonNative()) {
-      //check the ouput specs only if it is a storage handler (native tables's outputformats does
+      //check the output specs only if it is a storage handler (native tables's outputformats does
       //not set the job's output properties correctly)
       try {
         hiveOutputFormat.checkOutputSpecs(ignored, job);

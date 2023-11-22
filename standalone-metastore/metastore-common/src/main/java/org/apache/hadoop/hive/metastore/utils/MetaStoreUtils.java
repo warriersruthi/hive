@@ -23,9 +23,12 @@ import java.net.URL;
 import java.net.URLClassLoader;
 import java.security.AccessController;
 import java.security.PrivilegedAction;
-import java.text.DateFormat;
-import java.text.SimpleDateFormat;
+import java.sql.Date;
+import java.sql.Timestamp;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.time.format.ResolverStyle;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -74,25 +77,54 @@ import org.slf4j.LoggerFactory;
 import com.google.common.base.Joiner;
 
 public class MetaStoreUtils {
-  /** A fixed date format to be used for hive partition column values. */
-  public static final ThreadLocal<DateFormat> PARTITION_DATE_FORMAT =
-       new ThreadLocal<DateFormat>() {
-    @Override
-    protected DateFormat initialValue() {
-      DateFormat val = new SimpleDateFormat("yyyy-MM-dd");
-      val.setLenient(false); // Without this, 2020-20-20 becomes 2021-08-20.
-      val.setTimeZone(TimeZone.getTimeZone("UTC"));
-      return val;
-    }
-  };
-  public static final ThreadLocal<DateTimeFormatter> PARTITION_TIMESTAMP_FORMAT =
-      new ThreadLocal<DateTimeFormatter>() {
-        @Override
-        protected DateTimeFormatter initialValue() {
-          return DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").
-              withZone(TimeZone.getTimeZone("UTC").toZoneId());
-        }
-  };
+
+  private static final DateTimeFormatter DATE_FORMATTER = createDateTimeFormatter("uuuu-MM-dd");
+
+  private static final DateTimeFormatter TIMESTAMP_FORMATTER = createDateTimeFormatter("uuuu-MM-dd HH:mm:ss");
+
+  private static DateTimeFormatter createDateTimeFormatter(String format) {
+    return DateTimeFormatter.ofPattern(format).withZone(TimeZone.getTimeZone("UTC").toZoneId())
+        .withResolverStyle(ResolverStyle.STRICT);
+  }
+
+  /**
+   * Converts java.sql.Date to String format date.
+   * @param date - java.sql.Date object.
+   * @return Date in string format.
+   */
+  public static String convertDateToString(Date date) {
+    return DATE_FORMATTER.format(date.toLocalDate());
+  }
+
+  /**
+   * Converts string format date to java.sql.Date.
+   * @param date Date in string format.
+   * @return java.sql.Date object.
+   */
+  public static Date convertStringToDate(String date) {
+    LocalDate val = LocalDate.parse(date, DATE_FORMATTER);
+    return java.sql.Date.valueOf(val);
+  }
+
+  /**
+   * Converts java.sql.Timestamp to string format timestamp.
+   * @param timestamp java.sql.Timestamp object.
+   * @return Timestamp in string format.
+   */
+  public static String convertTimestampToString(Timestamp timestamp) {
+    return TIMESTAMP_FORMATTER.format(timestamp.toLocalDateTime());
+  }
+
+  /**
+   * Converts timestamp string format to java.sql.Timestamp.
+   * @param timestamp Timestamp in string format.
+   * @return java.sql.Timestamp object.
+   */
+  public static Timestamp convertStringToTimestamp(String timestamp) {
+    LocalDateTime val = LocalDateTime.from(TIMESTAMP_FORMATTER.parse(timestamp));
+    return Timestamp.valueOf(val);
+  }
+
   // Indicates a type was derived from the deserializer rather than Hive's metadata.
   public static final String TYPE_FROM_DESERIALIZER = "<derived from deserializer>";
 
@@ -274,7 +306,7 @@ public class MetaStoreUtils {
     return dbParameters != null && ReplConst.TRUE.equalsIgnoreCase(dbParameters.get(ReplConst.REPL_INCOMPATIBLE));
   }
 
-  public static boolean isDbBeingFailedOver(Database db) {
+  public static boolean isDbBeingPlannedFailedOver(Database db) {
     assert (db != null);
     Map<String, String> dbParameters = db.getParameters();
     if (dbParameters == null) {
@@ -285,7 +317,7 @@ public class MetaStoreUtils {
             || FailoverEndpoint.TARGET.toString().equalsIgnoreCase(dbFailoverEndPoint);
   }
 
-  public static boolean isDbBeingFailedOverAtEndpoint(Database db, FailoverEndpoint endPoint) {
+  public static boolean isDbBeingPlannedFailedOverAtEndpoint(Database db, FailoverEndpoint endPoint) {
     if (db == null) {
       return false;
     }
@@ -310,7 +342,7 @@ public class MetaStoreUtils {
     assert (db != null);
     if (isBackgroundThreadsEnabledForRepl(db)) {
       return false;
-    } else if (isDbBeingFailedOver(db)) {
+    } else if (isDbBeingPlannedFailedOver(db)) {
       LOG.info("Skipping all the tables which belong to database: {} as it is being failed over", db.getName());
       return true;
     } else if (isTargetOfReplication(db)) {
@@ -1152,15 +1184,30 @@ public class MetaStoreUtils {
   /**
    * Because TABLE_NO_AUTO_COMPACT was originally assumed to be NO_AUTO_COMPACT and then was moved
    * to no_auto_compact, we need to check it in both cases.
+   * Check the database level no_auto_compact , if present it is given priority else table level no_auto_compact is considered.
    */
-  public static boolean isNoAutoCompactSet(Map<String, String> parameters) {
-    String noAutoCompact =
-            parameters.get(hive_metastoreConstants.TABLE_NO_AUTO_COMPACT);
-    if (noAutoCompact == null) {
-      noAutoCompact =
-              parameters.get(hive_metastoreConstants.TABLE_NO_AUTO_COMPACT.toUpperCase());
+  public static boolean isNoAutoCompactSet(Map<String, String> dbParameters, Map<String, String> tblParameters) {
+    String dbNoAutoCompact = getNoAutoCompact(dbParameters);
+    if (dbNoAutoCompact == null) {
+      LOG.debug("Using table configuration '" + hive_metastoreConstants.NO_AUTO_COMPACT + "' for compaction");
+      String noAutoCompact = getNoAutoCompact(tblParameters);
+      return Boolean.parseBoolean(noAutoCompact);
     }
-    return noAutoCompact != null && noAutoCompact.equalsIgnoreCase("true");
+    LOG.debug("Using database configuration '" + hive_metastoreConstants.NO_AUTO_COMPACT + "' for compaction");
+    return Boolean.parseBoolean(dbNoAutoCompact);
+  }
+
+  /**
+   * Get no_auto_compact property by checking in both lower and upper cases
+   * @param parameters
+   * @return true/false if set, null if there is no NO_AUTO_COMPACT set in database level config,
+   */
+  public static String getNoAutoCompact(Map<String, String> parameters) {
+    String noAutoCompact = parameters.get(hive_metastoreConstants.NO_AUTO_COMPACT);
+    if (noAutoCompact == null) {
+      return parameters.get(hive_metastoreConstants.NO_AUTO_COMPACT.toUpperCase());
+    }
+    return noAutoCompact;
   }
 
   public static String getHostFromId(String id) {
@@ -1212,6 +1259,23 @@ public class MetaStoreUtils {
       result.setId(tableId);
     }
     return result;
+  }
+
+  public static <T> T createThriftPartitionsReq(Class<T> clazz, Configuration conf, T... deepCopy) {
+    final T req;
+    if (deepCopy != null && deepCopy.length == 1) {
+      assert clazz.isAssignableFrom(deepCopy[0].getClass());
+      req = JavaUtils.newInstance(clazz, new Class[]{clazz}, deepCopy);
+    } else {
+      req = JavaUtils.newInstance(clazz);
+    }
+    JavaUtils.setField(req, "setSkipColumnSchemaForPartition", new Class[]{boolean.class},
+        MetastoreConf.getBoolVar(conf, MetastoreConf.ConfVars.METASTORE_CLIENT_FIELD_SCHEMA_FOR_PARTITIONS));
+    JavaUtils.setField(req, "setIncludeParamKeyPattern", new Class[]{String.class},
+        MetastoreConf.getAsString(conf, MetastoreConf.ConfVars.METASTORE_PARTITIONS_PARAMETERS_INCLUDE_PATTERN));
+    JavaUtils.setField(req, "setExcludeParamKeyPattern", new Class[]{String.class},
+        MetastoreConf.getAsString(conf, MetastoreConf.ConfVars.METASTORE_PARTITIONS_PARAMETERS_EXCLUDE_PATTERN));
+    return req;
   }
 
   /**

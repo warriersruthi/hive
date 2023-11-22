@@ -25,12 +25,12 @@ import org.apache.hadoop.hive.common.ValidCompactorWriteIdList;
 import org.apache.hadoop.hive.common.ValidReadTxnList;
 import org.apache.hadoop.hive.common.ValidTxnList;
 import org.apache.hadoop.hive.metastore.DatabaseProduct;
+import org.apache.hadoop.hive.metastore.api.CompactionType;
 import org.apache.hadoop.hive.metastore.api.GetOpenTxnsResponse;
 import org.apache.hadoop.hive.metastore.api.MetaException;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.metastore.api.TableValidWriteIds;
 import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
-import org.apache.hadoop.hive.metastore.api.CompactionType;
 import org.apache.hadoop.hive.metastore.conf.MetastoreConf;
 import org.apache.hadoop.hive.metastore.conf.MetastoreConf.ConfVars;
 import org.apache.hadoop.hive.metastore.utils.JavaUtils;
@@ -38,6 +38,8 @@ import org.apache.hadoop.security.AccessControlException;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 
 import java.io.IOException;
 import java.security.PrivilegedExceptionAction;
@@ -48,42 +50,59 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import static org.apache.hadoop.hive.common.AcidConstants.SOFT_DELETE_TABLE;
 import static org.apache.hadoop.hive.metastore.DatabaseProduct.determineDatabaseProduct;
-import static org.apache.hadoop.hive.metastore.TransactionalValidationListener.INSERTONLY_TRANSACTIONAL_PROPERTY;
 import static org.apache.hadoop.hive.metastore.TransactionalValidationListener.DEFAULT_TRANSACTIONAL_PROPERTY;
+import static org.apache.hadoop.hive.metastore.TransactionalValidationListener.INSERTONLY_TRANSACTIONAL_PROPERTY;
 
 public class TxnUtils {
   private static final Logger LOG = LoggerFactory.getLogger(TxnUtils.class);
 
-  public static ValidTxnList createValidTxnListForCleaner(GetOpenTxnsResponse txns, long minOpenTxnGLB) {
-    long highWaterMark = minOpenTxnGLB - 1;
-    long[] abortedTxns = new long[txns.getOpen_txnsSize()];
+  /**
+   * Returns a valid txn list for cleaner.
+   * @param txns Response containing open txns list.
+   * @param minOpenTxn Minimum open txn which is min open write txn on the table in the case of abort cleanup.
+   * @param isAbortCleanup Whether the request is for abort cleanup.
+   * @return a valid txn list
+   */
+  public static ValidTxnList createValidTxnListForCleaner(GetOpenTxnsResponse txns, long minOpenTxn, boolean isAbortCleanup) {
+    long highWatermark = minOpenTxn - 1;
+    long[] exceptions = new long[txns.getOpen_txnsSize()];
     BitSet abortedBits = BitSet.valueOf(txns.getAbortedBits());
     int i = 0;
-    for(long txnId : txns.getOpen_txns()) {
-      if(txnId > highWaterMark) {
+    for (long txnId : txns.getOpen_txns()) {
+      if (txnId > highWatermark) {
         break;
       }
-      if(abortedBits.get(i)) {
-        abortedTxns[i] = txnId;
-      }
-      else {
-        assert false : JavaUtils.txnIdToString(txnId) + " is open and <= hwm:" + highWaterMark;
+      if (abortedBits.get(i)) {
+        exceptions[i] = txnId;
+      } else {
+        if (isAbortCleanup) {
+          exceptions[i] = txnId;
+        } else {
+          assert false : JavaUtils.txnIdToString(txnId) + " is open and <= hwm:" + highWatermark;
+        }
       }
       ++i;
     }
-    abortedTxns = Arrays.copyOf(abortedTxns, i);
-    BitSet bitSet = new BitSet(abortedTxns.length);
-    bitSet.set(0, abortedTxns.length);
-    //add ValidCleanerTxnList? - could be problematic for all the places that read it from
-    // string as they'd have to know which object to instantiate
-    return new ValidReadTxnList(abortedTxns, bitSet, highWaterMark, Long.MAX_VALUE);
+    exceptions = Arrays.copyOf(exceptions, i);
+    if (!isAbortCleanup) {
+      BitSet bitSet = new BitSet(exceptions.length);
+      bitSet.set(0, exceptions.length);
+      //add ValidCleanerTxnList? - could be problematic for all the places that read it from
+      // string as they'd have to know which object to instantiate
+      return new ValidReadTxnList(exceptions, bitSet, highWatermark, Long.MAX_VALUE);
+    } else {
+      return new ValidReadTxnList(exceptions, abortedBits, highWatermark, Long.MAX_VALUE);
+    }
   }
+
   /**
    * Transform a {@link org.apache.hadoop.hive.metastore.api.TableValidWriteIds} to a
    * {@link org.apache.hadoop.hive.common.ValidCompactorWriteIdList}.  This assumes that the caller intends to
@@ -95,8 +114,6 @@ public class TxnUtils {
    */
   public static ValidCompactorWriteIdList createValidCompactWriteIdList(TableValidWriteIds tableValidWriteIds) {
     String fullTableName = tableValidWriteIds.getFullTableName();
-    long highWater = tableValidWriteIds.getWriteIdHighWaterMark();
-    long minOpenWriteId = Long.MAX_VALUE;
     List<Long> invalids = tableValidWriteIds.getInvalidWriteIds();
     BitSet abortedBits = BitSet.valueOf(tableValidWriteIds.getAbortedBits());
     long[] exceptions = new long[invalids.size()];
@@ -105,20 +122,18 @@ public class TxnUtils {
       if (abortedBits.get(i)) {
         // Only need aborted since we don't consider anything above minOpenWriteId
         exceptions[i++] = writeId;
-      } else {
-        minOpenWriteId = Math.min(minOpenWriteId, writeId);
-      }
+      } 
     }
-    if(i < exceptions.length) {
+    if (i < exceptions.length) {
       exceptions = Arrays.copyOf(exceptions, i);
     }
-    highWater = minOpenWriteId == Long.MAX_VALUE ? highWater : minOpenWriteId - 1;
     BitSet bitSet = new BitSet(exceptions.length);
     bitSet.set(0, exceptions.length); // for ValidCompactorWriteIdList, everything in exceptions are aborted
-    if (minOpenWriteId == Long.MAX_VALUE) {
-      return new ValidCompactorWriteIdList(fullTableName, exceptions, bitSet, highWater);
+    if (tableValidWriteIds.isSetMinOpenWriteId()) {
+      long minOpenWriteId = tableValidWriteIds.getMinOpenWriteId();
+      return new ValidCompactorWriteIdList(fullTableName, exceptions, bitSet, minOpenWriteId - 1, minOpenWriteId);
     } else {
-      return new ValidCompactorWriteIdList(fullTableName, exceptions, bitSet, highWater, minOpenWriteId);
+      return new ValidCompactorWriteIdList(fullTableName, exceptions, bitSet, tableValidWriteIds.getWriteIdHighWaterMark());
     }
   }
 
@@ -132,6 +147,7 @@ public class TxnUtils {
     try {
       TxnStore handler = JavaUtils.getClass(className, TxnStore.class).newInstance();
       handler.setConf(conf);
+      handler = ProxyTxnHandler.getProxy(handler, handler.getRetryHandler(), handler.getJdbcResourceHolder());
       return handler;
     } catch (Exception e) {
       LOG.error("Unable to instantiate raw store directly in fastpath mode", e);
@@ -395,6 +411,50 @@ public class TxnUtils {
   }
 
   /**
+   * Executes the statement with an IN clause. If the number of elements or the length of the constructed statement would be
+   * too big, the IN clause will be split into multiple smaller ranges, and the statement will be executed multiple times.
+   * @param conf Hive configuration used to get the query and IN clause length limits.
+   * @param jdbcTemplate The {@link NamedParameterJdbcTemplate} instance to used for statement execution.
+   * @param query The query with the IN clause
+   * @param params A {@link MapSqlParameterSource} instance with the parameters of the query
+   * @param inClauseParamName The name of the parameter representing the content of the IN clause 
+   * @param elements A {@link List} containing the elements to put in the IN clause
+   * @param comparator A {@link Comparator} instance used to find the longest element in the list. Used to
+   *                   estimate the length of the query.
+   * @return Returns the total number of affected rows.
+   * @param <T> Type of the elements in the list.
+   */
+  public static <T> int executeStatementWithInClause(Configuration conf, NamedParameterJdbcTemplate jdbcTemplate, 
+                                                     String query, MapSqlParameterSource params, String inClauseParamName, 
+                                                     List<T> elements, Comparator<T> comparator) {
+    if (elements.size() == 0) {
+      throw new IllegalArgumentException("The elements list cannot be empty! An empty IN clause is invalid!");
+    }
+    if (!Pattern.compile("IN\\s*\\(\\s*:" + inClauseParamName + "\\s*\\)", Pattern.CASE_INSENSITIVE).matcher(query).find()) {
+      throw new IllegalArgumentException("The query must contain the IN(:" + inClauseParamName + ") clause!");      
+    }
+
+    int maxQueryLength = MetastoreConf.getIntVar(conf, ConfVars.DIRECT_SQL_MAX_QUERY_LENGTH) * 1024;
+    int batchSize = MetastoreConf.getIntVar(conf, ConfVars.DIRECT_SQL_MAX_ELEMENTS_IN_CLAUSE);
+    // The length of a single element is the string length of the longest element + 2 characters (comma, space) 
+    int elementLength = elements.stream().max(comparator).get().toString().length() + 2;
+    // estimated base query size: query size + the length of all parameters.
+    int baseQuerySize = query.length() + params.getValues().values().stream().mapToInt(s -> s.toString().length()).sum();
+    int maxElementsByLength = (maxQueryLength - baseQuerySize) / elementLength;
+
+    int inClauseMaxSize = Math.min(batchSize, maxElementsByLength);
+
+    int fromIndex = 0, totalCount = 0;
+    while (fromIndex < elements.size()) {
+      int endIndex = Math.min(elements.size(), fromIndex + inClauseMaxSize);
+      params.addValue(inClauseParamName, elements.subList(fromIndex, endIndex));
+      totalCount += jdbcTemplate.update(query, params);
+      fromIndex = endIndex;
+    }
+    return totalCount;
+  }
+
+  /**
    * Compute and return the size of a query statement with the given parameters as input variables.
    *
    * @param sizeSoFar     size of the current contents of the buf
@@ -567,7 +627,7 @@ public class TxnUtils {
     throw new IOException("Unable to stat file: " + p);
   }
 
-  public static CompactionType dbCompactionType2ThriftType(char dbValue) throws MetaException {
+  public static CompactionType dbCompactionType2ThriftType(char dbValue) throws SQLException {
     switch (dbValue) {
       case TxnStore.MAJOR_TYPE:
         return CompactionType.MAJOR;
@@ -575,8 +635,10 @@ public class TxnUtils {
         return CompactionType.MINOR;
       case TxnStore.REBALANCE_TYPE:
         return CompactionType.REBALANCE;
+      case TxnStore.ABORT_TXN_CLEANUP_TYPE:
+        return CompactionType.ABORT_TXN_CLEANUP;
       default:
-        throw new MetaException("Unexpected compaction type " + dbValue);
+        throw new SQLException("Unexpected compaction type " + dbValue);
     }
   }
 
@@ -588,8 +650,20 @@ public class TxnUtils {
         return TxnStore.MINOR_TYPE;
       case REBALANCE:
         return TxnStore.REBALANCE_TYPE;
+      case ABORT_TXN_CLEANUP:
+        return TxnStore.ABORT_TXN_CLEANUP_TYPE;
       default:
         throw new MetaException("Unexpected compaction type " + ct);
     }
+  }
+
+  /**
+   * A helper method to return SQL's 'IS NULL'
+   * clause whenever input is NULL.
+   * @param input A string to be compared to null.
+   * @return String
+   */
+  public static String nvl(String input) {
+    return input != null ? " = ? " : " IS NULL ";
   }
 }

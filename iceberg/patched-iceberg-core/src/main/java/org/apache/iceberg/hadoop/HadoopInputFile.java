@@ -167,6 +167,8 @@ public class HadoopInputFile implements InputFile, NativelyEncryptedFile {
     if (stat == null) {
       try {
         this.stat = fs.getFileStatus(path);
+      } catch (FileNotFoundException e) {
+        throw new NotFoundException(e, "File does not exist: %s", path);
       } catch (IOException e) {
         throw new RuntimeIOException(e, "Failed to get status for file: %s", path);
       }
@@ -188,7 +190,7 @@ public class HadoopInputFile implements InputFile, NativelyEncryptedFile {
       FutureDataInputStreamBuilder fsBuilder = fs.openFile(path);
       if (length != null) {
         LOG.debug("Using fs.option.openfile.length as {} for {}", length, location);
-        fsBuilder.opt("fs.option.openfile.length", length);
+        fsBuilder.opt("fs.option.openfile.length", Long.toString(length));
       }
       LOG.debug("Explicitly using fs.s3a.experimental.input.fadvise as normal for {}", location);
       return HadoopStreams.wrap(
@@ -238,9 +240,9 @@ public class HadoopInputFile implements InputFile, NativelyEncryptedFile {
   @Override
   public boolean exists() {
     try {
-      return fs.exists(path);
-    } catch (IOException e) {
-      throw new RuntimeIOException(e, "Failed to check existence for file: %s", path);
+      return lazyStat() != null;
+    } catch (NotFoundException e) {
+      return false;
     }
   }
 

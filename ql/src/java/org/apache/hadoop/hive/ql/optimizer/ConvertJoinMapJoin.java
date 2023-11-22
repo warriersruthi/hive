@@ -30,7 +30,6 @@ import java.util.Stack;
 import org.apache.hadoop.hive.common.JavaUtils;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
-import org.apache.hadoop.hive.metastore.utils.MetaStoreUtils;
 import org.apache.hadoop.hive.ql.exec.AppMasterEventOperator;
 import org.apache.hadoop.hive.ql.exec.CommonJoinOperator;
 import org.apache.hadoop.hive.ql.exec.CommonMergeJoinOperator;
@@ -51,6 +50,7 @@ import org.apache.hadoop.hive.ql.exec.TezDummyStoreOperator;
 import org.apache.hadoop.hive.ql.lib.Node;
 import org.apache.hadoop.hive.ql.lib.SemanticNodeProcessor;
 import org.apache.hadoop.hive.ql.lib.NodeProcessorCtx;
+import org.apache.hadoop.hive.ql.metadata.Table;
 import org.apache.hadoop.hive.ql.optimizer.physical.LlapClusterStateForCompile;
 import org.apache.hadoop.hive.ql.parse.GenTezUtils;
 import org.apache.hadoop.hive.ql.parse.OptimizeTezProcContext;
@@ -82,6 +82,8 @@ import org.slf4j.LoggerFactory;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.math.DoubleMath;
+
+import static org.apache.hadoop.hive.ql.exec.OperatorUtils.hasMoreOperatorsThan;
 
 /**
  * ConvertJoinMapJoin is an optimization that replaces a common join
@@ -659,15 +661,16 @@ public class ConvertJoinMapJoin implements SemanticNodeProcessor {
       // Prepare updated partition columns for small table(s).
       // Get the positions of bucketed columns
 
-      int i = 0;
+      int bigTableExprPos = 0;
       Map<String, ExprNodeDesc> colExprMap = bigTableRS.getColumnExprMap();
       for (ExprNodeDesc bigTableExpr : bigTablePartitionCols) {
         // It is guaranteed there is only 1 list within listBucketCols.
         for (String colName : listBucketCols.get(0)) {
           if (colExprMap.get(colName).isSame(bigTableExpr)) {
-            positions.add(i++);
+            positions.add(bigTableExprPos);
           }
         }
+        bigTableExprPos = bigTableExprPos + 1;
       }
     }
 
@@ -721,7 +724,7 @@ public class ConvertJoinMapJoin implements SemanticNodeProcessor {
 
 
   /**
-   * Preserves additional informations about the operator.
+   * Preserves additional information about the operator.
    *
    * When an operator is replaced by a new one; some of the information of the old have to be retained.
    */
@@ -750,10 +753,25 @@ public class ConvertJoinMapJoin implements SemanticNodeProcessor {
         context.conf.getBoolVar(HiveConf.ConfVars.HIVE_DISABLE_UNSAFE_EXTERNALTABLE_OPERATIONS);
     StringBuilder sb = new StringBuilder();
     for (Operator<?> parentOp : joinOp.getParentOperators()) {
-      if (shouldCheckExternalTables && hasExternalTableAncestor(parentOp, sb)) {
-        LOG.debug("External table {} found in join - disabling SMB join.", sb.toString());
+      if (shouldCheckExternalTables && !canTableUseStats(parentOp, sb)) {
+        LOG.debug("External table {} found in join and also could not provide statistics - disabling SMB join.", sb);
         return false;
       }
+      // GBY operators buffers one record. These are processed when ReduceRecordSources flushes the operator tree
+      // when end of record stream reached. If the tree has more than two GBY operators CommonMergeJoinOperator can
+      // not process all buffered records.
+      // HIVE-27788
+      if (parentOp.getParentOperators() != null) {
+        // Parent operator is RS and hasMoreOperatorsThan traverses until the next RS, so we start from grandparent
+        for (Operator<?> grandParent : parentOp.getParentOperators()) {
+          if (hasMoreOperatorsThan(grandParent, GroupByOperator.class, 1)) {
+            LOG.info("We cannot convert to SMB join " +
+                "because one of the join branches has more than one Group by operators in the same reducer.");
+            return false;
+          }
+        }
+      }
+
       // each side better have 0 or more RS. if either side is unbalanced, cannot convert.
       // This is a workaround for now. Right fix would be to refactor code in the
       // MapRecordProcessor and ReduceRecordProcessor with respect to the sources.
@@ -897,8 +915,9 @@ public class ConvertJoinMapJoin implements SemanticNodeProcessor {
     if (shouldCheckExternalTables) {
       StringBuilder sb = new StringBuilder();
       for (Operator<?> parentOp : joinOp.getParentOperators()) {
-        if (hasExternalTableAncestor(parentOp, sb)) {
-          LOG.debug("External table {} found in join - disabling bucket map join.", sb.toString());
+        if (!canTableUseStats(parentOp, sb)) {
+          LOG.debug("External table {} found in join and also could not provide statistics - " +
+              "disabling bucket map join.", sb);
           return false;
         }
       }
@@ -1540,9 +1559,7 @@ public class ConvertJoinMapJoin implements SemanticNodeProcessor {
         LOG.info("Selected dynamic partitioned hash join");
         MapJoinDesc mapJoinDesc = mapJoinOp.getConf();
         mapJoinDesc.setDynamicPartitionHashJoin(true);
-        if (mapJoinConversion.getIsFullOuterJoin()) {
-          FullOuterMapJoinOptimization.removeFilterMap(mapJoinDesc);
-        }
+
         // Set OpTraits for dynamically partitioned hash join:
         // bucketColNames: Re-use previous joinOp's bucketColNames. Parent operators should be
         //   reduce sink, which should have bucket columns based on the join keys.
@@ -1685,16 +1702,16 @@ public class ConvertJoinMapJoin implements SemanticNodeProcessor {
     return Math.min(Math.round(v), numRows);
   }
 
-  private static boolean hasExternalTableAncestor(Operator op, StringBuilder sb) {
-    boolean result = false;
+  private static boolean canTableUseStats(Operator op, StringBuilder sb) {
     Operator ancestor = OperatorUtils.findSingleOperatorUpstream(op, TableScanOperator.class);
     if (ancestor != null) {
       TableScanOperator ts = (TableScanOperator) ancestor;
-      if (MetaStoreUtils.isExternalTable(ts.getConf().getTableMetadata().getTTable())) {
+      Boolean canUseStats = StatsUtils.checkCanProvideStats(new Table(ts.getConf().getTableMetadata().getTTable()));
+      if (!canUseStats) {
         sb.append(ts.getConf().getTableMetadata().getFullyQualifiedName());
-        return true;
+        return false;
       }
     }
-    return result;
+    return true;
   }
 }

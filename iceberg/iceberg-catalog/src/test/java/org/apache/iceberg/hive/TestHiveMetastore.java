@@ -29,9 +29,9 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.metastore.HMSHandler;
+import org.apache.hadoop.hive.metastore.HMSHandlerProxyFactory;
 import org.apache.hadoop.hive.metastore.IHMSHandler;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
-import org.apache.hadoop.hive.metastore.RetryingHMSHandler;
 import org.apache.hadoop.hive.metastore.TSetIpAddressProcessor;
 import org.apache.hadoop.hive.metastore.api.GetTableRequest;
 import org.apache.hadoop.hive.metastore.api.Table;
@@ -48,11 +48,11 @@ import org.apache.thrift.server.TServer;
 import org.apache.thrift.server.TThreadPoolServer;
 import org.apache.thrift.transport.TServerSocket;
 import org.apache.thrift.transport.TTransportFactory;
-import org.junit.Assert;
 
 import static java.nio.file.Files.createTempDirectory;
 import static java.nio.file.attribute.PosixFilePermissions.asFileAttribute;
 import static java.nio.file.attribute.PosixFilePermissions.fromString;
+import static org.assertj.core.api.Assertions.assertThat;
 
 public class TestHiveMetastore {
 
@@ -67,8 +67,8 @@ public class TestHiveMetastore {
           .build();
 
   private static final DynMethods.StaticMethod GET_BASE_HMS_HANDLER = DynMethods.builder("getProxy")
-          .impl(RetryingHMSHandler.class, Configuration.class, IHMSHandler.class, boolean.class)
-          .impl(RetryingHMSHandler.class, HiveConf.class, IHMSHandler.class, boolean.class)
+          .impl(HMSHandlerProxyFactory.class, Configuration.class, IHMSHandler.class, boolean.class)
+          .impl(HMSHandlerProxyFactory.class, HiveConf.class, IHMSHandler.class, boolean.class)
           .buildStatic();
 
   // Hive3 introduces background metastore tasks (MetastoreTaskThread) for performing various cleanup duties. These
@@ -103,7 +103,7 @@ public class TestHiveMetastore {
         FileSystem fs = Util.getFs(localDirPath, new Configuration());
         String errMsg = "Failed to delete " + localDirPath;
         try {
-          Assert.assertTrue(errMsg, fs.delete(localDirPath, true));
+          assertThat(fs.delete(localDirPath, true)).as(errMsg).isTrue();
         } catch (IOException e) {
           throw new RuntimeException(errMsg, e);
         }

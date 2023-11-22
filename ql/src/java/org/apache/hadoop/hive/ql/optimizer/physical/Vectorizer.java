@@ -41,6 +41,7 @@ import java.util.TreeSet;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
+import com.google.common.annotations.VisibleForTesting;
 import org.apache.commons.lang3.ArrayUtils;
 import org.apache.commons.lang3.tuple.ImmutablePair;
 import org.apache.hadoop.hive.ql.exec.vector.VectorizedInputFormatInterface;
@@ -296,8 +297,15 @@ public class Vectorizer implements PhysicalPlanResolver {
       .collect(Collectors.toSet());
 
   // The set of virtual columns that vectorized readers *MAY* support.
-  public static final ImmutableSet<VirtualColumn> vectorizableVirtualColumns =
-      ImmutableSet.of(VirtualColumn.ROWID, VirtualColumn.ROWISDELETED);
+  public static final ImmutableSet<VirtualColumn> vectorizableVirtualColumns = 
+      ImmutableSet.of(
+        VirtualColumn.ROWID, 
+        VirtualColumn.ROWISDELETED,
+        VirtualColumn.PARTITION_SPEC_ID, 
+        VirtualColumn.PARTITION_HASH, 
+        VirtualColumn.FILE_PATH, 
+        VirtualColumn.ROW_POSITION
+      );
 
   private HiveConf hiveConf;
 
@@ -1895,7 +1903,7 @@ public class Vectorizer implements PhysicalPlanResolver {
         if (isPartitionRowConversion && isLlapIoEnabled) {
           enabledConditionsNotMetList.add(
               "Could not enable vectorization. " +
-              "LLAP I/O is enabled wbich automatically deserializes into " +
+              "LLAP I/O is enabled which automatically deserializes into " +
               "VECTORIZED_INPUT_FILE_FORMAT. " +
               "A partition requires data type conversion and that is not supported");
 
@@ -1990,7 +1998,7 @@ public class Vectorizer implements PhysicalPlanResolver {
         supportRemovedReasons.add(removeString);
       }
 
-      // Now rememember what is supported for this query and any support that was
+      // Now remember what is supported for this query and any support that was
       // removed.
       vectorTaskColumnInfo.setSupportSetInUse(supportSet);
       vectorTaskColumnInfo.setSupportRemovedReasons(supportRemovedReasons);
@@ -4377,6 +4385,7 @@ public class Vectorizer implements PhysicalPlanResolver {
     return false;
   }
 
+  @VisibleForTesting
   public static Operator<? extends OperatorDesc> vectorizeFilterOperator(
       Operator<? extends OperatorDesc> filterOp, VectorizationContext vContext,
       VectorFilterDesc vectorFilterDesc)
@@ -4397,9 +4406,10 @@ public class Vectorizer implements PhysicalPlanResolver {
         vContext, vectorFilterDesc);
   }
 
-  private static Operator<? extends OperatorDesc> vectorizeTopNKeyOperator(
-      Operator<? extends OperatorDesc> topNKeyOperator, VectorizationContext vContext,
-      VectorTopNKeyDesc vectorTopNKeyDesc) throws HiveException {
+  @VisibleForTesting
+  public static Operator<? extends OperatorDesc> vectorizeTopNKeyOperator(
+          Operator<? extends OperatorDesc> topNKeyOperator, VectorizationContext vContext,
+          VectorTopNKeyDesc vectorTopNKeyDesc) throws HiveException {
 
     TopNKeyDesc topNKeyDesc = (TopNKeyDesc) topNKeyOperator.getConf();
     VectorExpression[] keyExpressions = getVectorExpressions(vContext, topNKeyDesc.getKeyColumns());

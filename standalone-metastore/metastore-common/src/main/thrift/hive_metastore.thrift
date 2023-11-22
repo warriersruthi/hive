@@ -164,6 +164,24 @@ enum PrincipalType {
 const string HIVE_FILTER_FIELD_OWNER = "hive_filter_field_owner__"
 const string HIVE_FILTER_FIELD_PARAMS = "hive_filter_field_params__"
 const string HIVE_FILTER_FIELD_LAST_ACCESS = "hive_filter_field_last_access__"
+const string HIVE_FILTER_FIELD_TABLE_NAME = "hive_filter_field_tableName__"
+const string HIVE_FILTER_FIELD_TABLE_TYPE = "hive_filter_field_tableType__"
+
+struct PropertySetRequest {
+    1: required string nameSpace;
+    2: map<string, string> propertyMap;
+}
+
+struct PropertyGetRequest {
+    1: required string nameSpace;
+    2: string mapPrefix;
+    3: optional string mapPredicate;
+    4: optional list<string> mapSelection;
+}
+
+struct PropertyGetResponse {
+    1: map<string, map<string , string>> properties;
+}
 
 enum PartitionEventType {
   LOAD_DONE = 1,
@@ -200,6 +218,7 @@ enum CompactionType {
     MINOR = 1,
     MAJOR = 2,
     REBALANCE = 3,
+    ABORT_TXN_CLEANUP = 4,
 }
 
 enum GrantRevokeType {
@@ -860,7 +879,10 @@ struct PartitionsByExprRequest {
   6: optional string catName,
   7: optional string order
   8: optional string validWriteIdList,
-  9: optional i64 id=-1 // table id
+  9: optional i64 id=-1, // table id
+  10: optional bool skipColumnSchemaForPartition,
+  11: optional string includeParamKeyPattern,
+  12: optional string excludeParamKeyPattern
 }
 
 struct TableStatsResult {
@@ -896,7 +918,8 @@ struct PartitionsStatsRequest {
 // Return type for add_partitions_req
 struct AddPartitionsResult {
   1: optional list<Partition> partitions,
-  2: optional bool isStatsCompliant
+  2: optional bool isStatsCompliant,
+  3: optional list<FieldSchema> partitionColSchema
 }
 
 // Request type for add_partitions_req
@@ -907,7 +930,9 @@ struct AddPartitionsRequest {
   4: required bool ifNotExists,
   5: optional bool needResult=true,
   6: optional string catName,
-  7: optional string validWriteIdList
+  7: optional string validWriteIdList,
+  8: optional bool skipColumnSchemaForPartition,
+  9: optional list<FieldSchema> partitionColSchema
 }
 
 // Return type for drop_partitions_req
@@ -936,7 +961,8 @@ struct DropPartitionsRequest {
   6: optional bool ignoreProtection,
   7: optional EnvironmentContext environmentContext,
   8: optional bool needResult=true,
-  9: optional string catName
+  9: optional string catName,
+  10: optional bool skipColumnSchemaForPartition
 }
 
 struct PartitionValuesRequest {
@@ -970,7 +996,10 @@ struct GetPartitionsByNamesRequest {
   7: optional string engine,
   8: optional string validWriteIdList,
   9: optional bool getFileMetadata,
-  10: optional i64 id=-1  // table id
+  10: optional i64 id=-1,  // table id
+  11: optional bool skipColumnSchemaForPartition,
+  12: optional string includeParamKeyPattern,
+  13: optional string excludeParamKeyPattern
 }
 
 struct GetPartitionsByNamesResult {
@@ -1005,7 +1034,8 @@ enum TxnType {
     READ_ONLY    = 2,
     COMPACTION   = 3,
     MATER_VIEW_REBUILD = 4,
-    SOFT_DELETE  = 5
+    SOFT_DELETE  = 5,
+    REBALANCE_COMPACTION = 6
 }
 
 // specifies which info to return with GetTablesExtRequest
@@ -1076,10 +1106,12 @@ struct AbortTxnRequest {
     1: required i64 txnid,
     2: optional string replPolicy,
     3: optional TxnType txn_type,
+    4: optional i64 errorCode,
 }
 
 struct AbortTxnsRequest {
     1: required list<i64> txn_ids,
+    2: optional i64 errorCode,
 }
 
 struct CommitTxnKeyValue {
@@ -1215,7 +1247,8 @@ struct LockRequest {
     4: required string hostname, // used in 'show locks' to help admins find who has open locks
     5: optional string agentInfo = "Unknown",
     6: optional bool zeroWaitReadEnabled = false,
-    7: optional bool exclusiveCTAS = false
+    7: optional bool exclusiveCTAS = false,
+    8: optional bool locklessReadsEnabled = false
 }
 
 struct LockResponse {
@@ -1290,6 +1323,8 @@ struct CompactionRequest {
     7: optional string initiatorId
     8: optional string initiatorVersion
     9: optional string poolName
+    10: optional i32 numberOfBuckets
+    11: optional string orderByClause;
 }
 
 struct CompactionInfoStruct {
@@ -1310,6 +1345,8 @@ struct CompactionInfoStruct {
     15: optional i64 enqueueTime,
     16: optional i64 retryRetention,
     17: optional string poolname
+    18: optional i32 numberOfBuckets
+    19: optional string orderByClause;
 }
 
 struct OptionalCompactionInfoStruct {
@@ -1394,6 +1431,22 @@ struct ShowCompactResponse {
     1: required list<ShowCompactResponseElement> compacts,
 }
 
+struct AbortCompactionRequest {
+    1: required list<i64> compactionIds,
+    2: optional string type,
+    3: optional string poolName
+}
+
+struct AbortCompactionResponseElement {
+    1: required i64 compactionId,
+    2: optional string status,
+    3: optional string message
+}
+
+struct AbortCompactResponse {
+    1: required map<i64, AbortCompactionResponseElement> abortedcompacts,
+}
+
 struct GetLatestCommittedCompactionInfoRequest {
     1: required string dbname,
     2: required string tablename,
@@ -1434,6 +1487,9 @@ struct NotificationEventRequest {
     1: required i64 lastEvent,
     2: optional i32 maxEvents,
     3: optional list<string> eventTypeSkipList,
+    4: optional string catName,
+    5: optional string dbName,
+    6: optional list<string> tableNames
 }
 
 struct NotificationEvent {
@@ -1460,7 +1516,8 @@ struct NotificationEventsCountRequest {
     2: required string dbName,
     3: optional string catName,
     4: optional i64 toEventId,
-    5: optional i64 limit
+    5: optional i64 limit,
+    6: optional list<string> tableNames
 }
 
 struct NotificationEventsCountResponse {
@@ -1479,9 +1536,11 @@ struct InsertEventRequestData {
 }
 
 union FireEventRequestData {
-    1: InsertEventRequestData insertData
+    1: optional InsertEventRequestData insertData,
     // used to fire insert events on multiple partitions
-    2: list<InsertEventRequestData> insertDatas
+    2: optional list<InsertEventRequestData> insertDatas,
+    // Identify if it is a refresh or invalidate event
+    3: optional bool refreshEvent
 }
 
 struct FireEventRequest {
@@ -1494,6 +1553,7 @@ struct FireEventRequest {
     // ignored if event request data contains multiple insert event datas
     5: optional list<string> partitionVals,
     6: optional string catName,
+    7: optional map<string, string> tblParams,
 }
 
 struct FireEventResponse {
@@ -1726,6 +1786,8 @@ struct TableMeta {
   3: required string tableType;
   4: optional string comments;
   5: optional string catName;
+  6: optional string ownerName;
+  7: optional PrincipalType ownerType;
 }
 
 struct Materialization {
@@ -2137,7 +2199,9 @@ struct AlterPartitionsRequest {
   4: required list<Partition> partitions,
   5: optional EnvironmentContext environmentContext,
   6: optional i64 writeId=-1,
-  7: optional string validWriteIdList
+  7: optional string validWriteIdList,
+  8: optional bool skipColumnSchemaForPartition,
+  9: optional list<FieldSchema> partitionColSchema
 }
 
 struct AlterPartitionsResponse {
@@ -2166,7 +2230,9 @@ struct AlterTableRequest {
   6: optional i64 writeId=-1,
   7: optional string validWriteIdList
   8: optional list<string> processorCapabilities,
-  9: optional string processorIdentifier
+  9: optional string processorIdentifier,
+  10: optional string expectedParameterKey,
+  11: optional string expectedParameterValue
 // TODO: also add cascade here, out of envCtx
 }
 
@@ -2247,11 +2313,25 @@ struct PartitionsRequest { // Not using Get prefix as that name is already used 
    3: required string tblName,
    4: optional i16 maxParts=-1,
    5: optional string validWriteIdList,
-   6: optional i64 id=-1 // table id
+   6: optional i64 id=-1, // table id
+   7: optional bool skipColumnSchemaForPartition,
+   8: optional string includeParamKeyPattern,
+   9: optional string excludeParamKeyPattern
 }
 
 struct PartitionsResponse { // Not using Get prefix as that name is already used for a different method
    1: required list<Partition> partitions
+}
+
+struct GetPartitionsByFilterRequest {
+   1: optional string catName,
+   2: string dbName,
+   3: string tblName,
+   4: string filter,
+   5: optional i16 maxParts=-1,
+   6: optional bool skipColumnSchemaForPartition,
+   7: optional string includeParamKeyPattern,
+   8: optional string excludeParamKeyPattern
 }
 
 struct GetPartitionNamesPsRequest {
@@ -2278,6 +2358,9 @@ struct GetPartitionsPsWithAuthRequest {
    7: optional list<string> groupNames,
    8: optional string validWriteIdList,
    9: optional i64 id=-1 // table id
+   10: optional bool skipColumnSchemaForPartition,
+   11: optional string includeParamKeyPattern,
+   12: optional string excludeParamKeyPattern
 }
 
 struct GetPartitionsPsWithAuthResponse {
@@ -2430,11 +2513,19 @@ exception NoSuchLockException {
     1: string message
 }
 
+exception CompactionAbortedException {
+    1: string message
+}
+
+exception NoSuchCompactionException {
+    1: string message
+}
 /**
 * This interface is live.
 */
 service ThriftHiveMetastore extends fb303.FacebookService
 {
+  AbortCompactResponse abort_Compactions(1: AbortCompactionRequest rqst)
   string getMetaConf(1:string key) throws(1:MetaException o1)
   void setMetaConf(1:string key, 2:string value) throws(1:MetaException o1)
 
@@ -2455,7 +2546,7 @@ service ThriftHiveMetastore extends fb303.FacebookService
 
   void create_dataconnector(1:DataConnector connector) throws(1:AlreadyExistsException o1, 2:InvalidObjectException o2, 3:MetaException o3)
   DataConnector get_dataconnector_req(1:GetDataConnectorRequest request) throws(1:NoSuchObjectException o1, 2:MetaException o2)
-  void drop_dataconnector(1:string name, bool ifNotExists, bool checkReferences) throws(1:NoSuchObjectException o1, 2:InvalidOperationException o2, 3:MetaException o3)
+  void drop_dataconnector(1:string name, 2:bool ifNotExists, 3:bool checkReferences) throws(1:NoSuchObjectException o1, 2:InvalidOperationException o2, 3:MetaException o3)
   list<string> get_dataconnectors() throws(1:MetaException o1)
   void alter_dataconnector(1:string name, 2:DataConnector connector) throws(1:MetaException o1, 2:NoSuchObjectException o2)
 
@@ -2706,6 +2797,9 @@ PartitionsResponse get_partitions_req(1:PartitionsRequest req)
     3:string filter, 4:i16 max_parts=-1)
                        throws(1:MetaException o1, 2:NoSuchObjectException o2)
 
+  list<Partition> get_partitions_by_filter_req(1:GetPartitionsByFilterRequest req)
+    throws(1:MetaException o1, 2:NoSuchObjectException o2)
+
   // List partitions as PartitionSpec instances.
   list<PartitionSpec> get_part_specs_by_filter(1:string db_name 2:string tbl_name
     3:string filter, 4:i32 max_parts=-1)
@@ -2729,9 +2823,14 @@ PartitionsResponse get_partitions_req(1:PartitionsRequest req)
 
   // get partitions give a list of partition names
   list<Partition> get_partitions_by_names(1:string db_name 2:string tbl_name 3:list<string> names)
-                       throws(1:MetaException o1, 2:NoSuchObjectException o2)
+      throws(1:MetaException o1, 2:NoSuchObjectException o2, 3:InvalidObjectException o3)
   GetPartitionsByNamesResult get_partitions_by_names_req(1:GetPartitionsByNamesRequest req)
-                        throws(1:MetaException o1, 2:NoSuchObjectException o2)
+      throws(1:MetaException o1, 2:NoSuchObjectException o2, 3:InvalidObjectException o3)
+
+    // retrieve properties
+    PropertyGetResponse get_properties(1:PropertyGetRequest req) throws(1:MetaException e1, 2:NoSuchObjectException e2);
+    // set properties
+    bool set_properties(1:PropertySetRequest req) throws(1:MetaException e1, 2:NoSuchObjectException e2);
 
   // changes the partition to the new partition object. partition is identified from the part values
   // in the new_part
@@ -2973,6 +3072,7 @@ PartitionsResponse get_partitions_req(1:PartitionsRequest req)
   void repl_tbl_writeid_state(1: ReplTblWriteIdStateRequest rqst)
   GetValidWriteIdsResponse get_valid_write_ids(1:GetValidWriteIdsRequest rqst)
       throws (1:NoSuchTxnException o1, 2:MetaException o2)
+  void add_write_ids_to_min_history(1:i64 txnId, 2: map<string, i64> writeIds) throws (1:MetaException o2)
   AllocateTableWriteIdsResponse allocate_table_write_ids(1:AllocateTableWriteIdsRequest rqst)
     throws (1:NoSuchTxnException o1, 2:TxnAbortedException o2, 3:MetaException o3)
   MaxAllocatedTableWriteIdResponse get_max_allocated_table_write_id(1:MaxAllocatedTableWriteIdRequest rqst)
@@ -3175,7 +3275,7 @@ const string FILE_INPUT_FORMAT    = "file.inputformat",
 const string FILE_OUTPUT_FORMAT   = "file.outputformat",
 const string META_TABLE_STORAGE   = "storage_handler",
 const string TABLE_IS_TRANSACTIONAL = "transactional",
-const string TABLE_NO_AUTO_COMPACT = "no_auto_compaction",
+const string NO_AUTO_COMPACT = "no_auto_compaction",
 const string TABLE_TRANSACTIONAL_PROPERTIES = "transactional_properties",
 const string TABLE_BUCKETING_VERSION = "bucketing_version",
 const string DRUID_CONFIG_PREFIX = "druid.",
@@ -3190,3 +3290,7 @@ const string DEFAULT_TABLE_TYPE = "defaultTableType",
 // ACID
 const string TXN_ID = "txnId",
 const string WRITE_ID = "writeId",
+
+// Keys for alter table environment context parameters
+const string EXPECTED_PARAMETER_KEY = "expected_parameter_key",
+const string EXPECTED_PARAMETER_VALUE = "expected_parameter_value",

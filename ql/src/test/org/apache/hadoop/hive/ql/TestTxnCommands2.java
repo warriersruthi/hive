@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -58,6 +59,9 @@ import org.apache.hadoop.hive.metastore.api.OpenTxnsResponse;
 import org.apache.hadoop.hive.metastore.api.ShowCompactRequest;
 import org.apache.hadoop.hive.metastore.api.ShowCompactResponse;
 import org.apache.hadoop.hive.metastore.api.ShowCompactResponseElement;
+import org.apache.hadoop.hive.metastore.api.AbortCompactResponse;
+import org.apache.hadoop.hive.metastore.api.AbortCompactionRequest;
+import org.apache.hadoop.hive.metastore.api.AbortCompactionResponseElement;
 import org.apache.hadoop.hive.metastore.conf.MetastoreConf;
 import org.apache.hadoop.hive.metastore.txn.AcidHouseKeeperService;
 import org.apache.hadoop.hive.metastore.utils.TestTxnDbUtil;
@@ -76,6 +80,7 @@ import org.apache.hadoop.hive.ql.scheduled.ScheduledQueryExecutionService;
 import org.apache.hadoop.hive.ql.schq.MockScheduledQueryService;
 import org.apache.hadoop.hive.ql.session.SessionState;
 import org.apache.hadoop.hive.ql.txn.compactor.CompactorFactory;
+import org.apache.hadoop.hive.ql.txn.compactor.CompactorPipeline;
 import org.apache.hadoop.hive.ql.txn.compactor.MRCompactor;
 import org.apache.hadoop.hive.ql.txn.compactor.Worker;
 import org.apache.hadoop.io.Writable;
@@ -96,7 +101,8 @@ import org.junit.rules.ExpectedException;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.is;
 import static org.mockito.ArgumentMatchers.any;
-import static org.powermock.api.mockito.PowerMockito.when;
+import static org.mockito.Mockito.when;
+
 import org.mockito.Mockito;
 import org.mockito.stubbing.Answer;
 
@@ -151,6 +157,8 @@ public class TestTxnCommands2 extends TxnCommandsBaseForTests {
     //TestTxnCommands2WithSplitUpdateAndVectorization has the vectorized version
     //of these tests.
     HiveConf.setBoolVar(hiveConf, HiveConf.ConfVars.HIVE_VECTORIZATION_ENABLED, false);
+    //TestTxnCommands2WithAbortCleanupUsingCompactionCycle has the tests with abort cleanup in compaction cycle
+    MetastoreConf.setBoolVar(hiveConf, MetastoreConf.ConfVars.COMPACTOR_CLEAN_ABORTS_USING_CLEANER, true);
     HiveConf.setBoolVar(hiveConf, HiveConf.ConfVars.HIVEOPTIMIZEMETADATAQUERIES, false);
     HiveConf.setBoolVar(hiveConf, HiveConf.ConfVars.HIVE_ACID_TRUNCATE_USE_BASE, false);
   }
@@ -1219,6 +1227,7 @@ public class TestTxnCommands2 extends TxnCommandsBaseForTests {
     }
     hiveConf.setBoolVar(HiveConf.ConfVars.HIVETESTMODEFAILCOMPACTION, true);
     MetastoreConf.setBoolVar(hiveConf, MetastoreConf.ConfVars.COMPACTOR_INITIATOR_ON, true);
+    MetastoreConf.setBoolVar(hiveConf, MetastoreConf.ConfVars.COMPACTOR_CLEANER_ON, true);
 
     int numFailedCompactions = MetastoreConf.getIntVar(hiveConf, MetastoreConf.ConfVars.COMPACTOR_INITIATOR_FAILED_THRESHOLD);
     AtomicBoolean stop = new AtomicBoolean(true);
@@ -1299,6 +1308,7 @@ public class TestTxnCommands2 extends TxnCommandsBaseForTests {
       runStatementOnDriver("insert into " + tblName + " values(" + (i + 1) + ", 'foo'),(" + (i + 2) + ", 'bar'),(" + (i + 3) + ", 'baz')");
     }
     MetastoreConf.setBoolVar(hiveConf, MetastoreConf.ConfVars.COMPACTOR_INITIATOR_ON, true);
+    MetastoreConf.setBoolVar(hiveConf, MetastoreConf.ConfVars.COMPACTOR_CLEANER_ON, true);
     runInitiator(hiveConf);
     runWorker(hiveConf);
     runCleaner(hiveConf);
@@ -1427,6 +1437,10 @@ public class TestTxnCommands2 extends TxnCommandsBaseForTests {
     execDDLOpAndCompactionConcurrently("TRUNCATE_PARTITION", true);
   }
   private void execDDLOpAndCompactionConcurrently(String opType, boolean isPartioned) throws Exception {
+    // Stats gathering needs to be disabled as it runs in a separate transaction, and it cannot be synchronized using
+    // countdownlatch, because the Statsupdater instance is private and static.
+    hiveConf.setBoolVar(HiveConf.ConfVars.HIVE_COMPACTOR_GATHER_STATS, false);
+
     String tblName = "hive12352";
     String partName = "test";
 
@@ -1449,21 +1463,28 @@ public class TestTxnCommands2 extends TxnCommandsBaseForTests {
     txnHandler.compact(req);
     MRCompactor mrCompactor = Mockito.spy(new MRCompactor(HiveMetaStoreUtils.getHiveMetastoreClient(hiveConf)));
 
+    CountDownLatch ddlStart = new CountDownLatch(1);
     Mockito.doAnswer((Answer<JobConf>) invocationOnMock -> {
       JobConf job = (JobConf) invocationOnMock.callRealMethod();
       job.setMapperClass(SlowCompactorMap.class);
+      //let concurrent DDL oparetaions to start in the middle of the Compaction Txn, right before SlowCompactorMap will
+      //mimic a long-running compaction
+      ddlStart.countDown();
       return job;
     }).when(mrCompactor).createBaseJobConf(any(), any(), any(), any(), any(), any());
 
     CompactorFactory mockedFactory = Mockito.mock(CompactorFactory.class);
-    when(mockedFactory.getCompactor(any(), any(), any(), any())).thenReturn(mrCompactor);
+    when(mockedFactory.getCompactorPipeline(any(), any(), any(), any())).thenReturn(new CompactorPipeline(mrCompactor));
 
-    Worker worker = Mockito.spy(new Worker(mockedFactory));
+    Worker worker = new Worker(mockedFactory);
     worker.setConf(hiveConf);
     worker.init(new AtomicBoolean(true));
 
     CompletableFuture<Void> compactionJob = CompletableFuture.runAsync(worker);
-    Thread.sleep(1000);
+
+    if (!ddlStart.await(5000, TimeUnit.MILLISECONDS)) {
+      Assert.fail("Waiting too long for compaction to start!");
+    }
 
     int compHistory = 0;
     switch (opType) {
@@ -2602,6 +2623,7 @@ public class TestTxnCommands2 extends TxnCommandsBaseForTests {
 
   @Test
   public void testDynPartInsertWithAborts() throws Exception {
+    boolean useCleanerForAbortCleanup = MetastoreConf.getBoolVar(hiveConf, MetastoreConf.ConfVars.COMPACTOR_CLEAN_ABORTS_USING_CLEANER);
     int[][] resultData = new int[][]{{1, 1}, {2, 2}};
     runStatementOnDriver("insert into " + Table.ACIDTBLPART + " partition(p) values(1,1,'p1'),(2,2,'p1')");
     verifyDeltaDirAndResult(1, Table.ACIDTBLPART.toString(), "p=p1", resultData);
@@ -2623,7 +2645,8 @@ public class TestTxnCommands2 extends TxnCommandsBaseForTests {
     count = TestTxnDbUtil.countQueryAgent(hiveConf, "select count(*) from COMPACTION_QUEUE");
     // Only one job is added to the queue per table. This job corresponds to all the entries for a particular table
     // with rows in TXN_COMPONENTS
-    Assert.assertEquals(TestTxnDbUtil.queryToString(hiveConf, "select * from COMPACTION_QUEUE"), 1, count);
+    Assert.assertEquals(TestTxnDbUtil.queryToString(hiveConf, "select * from COMPACTION_QUEUE"),
+            useCleanerForAbortCleanup ? 0 : 1, count);
 
     runWorker(hiveConf);
     runCleaner(hiveConf);
@@ -2633,6 +2656,7 @@ public class TestTxnCommands2 extends TxnCommandsBaseForTests {
 
   @Test
   public void testDynPartInsertWithMultiPartitionAborts() throws Exception {
+    boolean useCleanerForAbortCleanup = MetastoreConf.getBoolVar(hiveConf, MetastoreConf.ConfVars.COMPACTOR_CLEAN_ABORTS_USING_CLEANER);
     int [][] resultData = new int[][] {{1,1}, {2,2}};
     runStatementOnDriver("insert into " + Table.ACIDTBLPART + " partition(p) values(1,1,'p1'),(2,2,'p1')");
     runStatementOnDriver("insert into " + Table.ACIDTBLPART + " partition(p) values(1,1,'p2'),(2,2,'p2')");
@@ -2662,7 +2686,8 @@ public class TestTxnCommands2 extends TxnCommandsBaseForTests {
     count = TestTxnDbUtil.countQueryAgent(hiveConf, "select count(*) from COMPACTION_QUEUE");
     // Only one job is added to the queue per table. This job corresponds to all the entries for a particular table
     // with rows in TXN_COMPONENTS
-    Assert.assertEquals(TestTxnDbUtil.queryToString(hiveConf, "select * from COMPACTION_QUEUE"), 1, count);
+    Assert.assertEquals(TestTxnDbUtil.queryToString(hiveConf, "select * from COMPACTION_QUEUE"),
+            useCleanerForAbortCleanup ? 0 : 1, count);
 
     r1 = runStatementOnDriver("select count(*) from " + Table.ACIDTBLPART);
     Assert.assertEquals("4", r1.get(0));
@@ -2678,6 +2703,7 @@ public class TestTxnCommands2 extends TxnCommandsBaseForTests {
 
   @Test
   public void testDynPartIOWWithAborts() throws Exception {
+    boolean useCleanerForAbortCleanup = MetastoreConf.getBoolVar(hiveConf, MetastoreConf.ConfVars.COMPACTOR_CLEAN_ABORTS_USING_CLEANER);
     int [][] resultData = new int[][] {{1,1}, {2,2}};
     runStatementOnDriver("insert into " + Table.ACIDTBLPART + " partition(p) values(1,1,'p1'),(2,2,'p1')");
     verifyDeltaDirAndResult(1, Table.ACIDTBLPART.toString(), "p=p1", resultData);
@@ -2700,7 +2726,8 @@ public class TestTxnCommands2 extends TxnCommandsBaseForTests {
     count = TestTxnDbUtil.countQueryAgent(hiveConf, "select count(*) from COMPACTION_QUEUE");
     // Only one job is added to the queue per table. This job corresponds to all the entries for a particular table
     // with rows in TXN_COMPONENTS
-    Assert.assertEquals(TestTxnDbUtil.queryToString(hiveConf, "select * from COMPACTION_QUEUE"), 1, count);
+    Assert.assertEquals(TestTxnDbUtil.queryToString(hiveConf, "select * from COMPACTION_QUEUE"),
+            useCleanerForAbortCleanup ? 0 : 1, count);
 
     runWorker(hiveConf);
     runCleaner(hiveConf);
@@ -2711,6 +2738,7 @@ public class TestTxnCommands2 extends TxnCommandsBaseForTests {
 
   @Test
   public void testDynPartIOWWithMultiPartitionAborts() throws Exception {
+    boolean useCleanerForAbortCleanup = MetastoreConf.getBoolVar(hiveConf, MetastoreConf.ConfVars.COMPACTOR_CLEAN_ABORTS_USING_CLEANER);
     int [][] resultData = new int[][] {{1,1}, {2,2}};
     runStatementOnDriver("insert into " + Table.ACIDTBLPART + " partition(p) values(1,1,'p1'),(2,2,'p1')");
     runStatementOnDriver("insert into " + Table.ACIDTBLPART + " partition(p) values(1,1,'p2'),(2,2,'p2')");
@@ -2742,7 +2770,8 @@ public class TestTxnCommands2 extends TxnCommandsBaseForTests {
     count = TestTxnDbUtil.countQueryAgent(hiveConf, "select count(*) from COMPACTION_QUEUE");
     // Only one job is added to the queue per table. This job corresponds to all the entries for a particular table
     // with rows in TXN_COMPONENTS
-    Assert.assertEquals(TestTxnDbUtil.queryToString(hiveConf, "select * from COMPACTION_QUEUE"), 1, count);
+    Assert.assertEquals(TestTxnDbUtil.queryToString(hiveConf, "select * from COMPACTION_QUEUE"),
+            useCleanerForAbortCleanup ? 0 : 1, count);
 
     r1 = runStatementOnDriver("select count(*) from " + Table.ACIDTBLPART);
     Assert.assertEquals("4", r1.get(0));
@@ -2760,6 +2789,7 @@ public class TestTxnCommands2 extends TxnCommandsBaseForTests {
 
   @Test
   public void testDynPartUpdateWithAborts() throws Exception {
+    boolean useCleanerForAbortCleanup = MetastoreConf.getBoolVar(hiveConf, MetastoreConf.ConfVars.COMPACTOR_CLEAN_ABORTS_USING_CLEANER);
     int[][] resultData1 = new int[][]{{1, 2}, {3, 4}};
     runStatementOnDriver("insert into " + Table.ACIDTBLPART + " partition(p) values (1,2,'p1')");
     runStatementOnDriver("insert into " + Table.ACIDTBLPART + " partition(p) values (3,4,'p1')");
@@ -2783,7 +2813,8 @@ public class TestTxnCommands2 extends TxnCommandsBaseForTests {
     count = TestTxnDbUtil.countQueryAgent(hiveConf, "select count(*) from COMPACTION_QUEUE");
     // Only one job is added to the queue per table. This job corresponds to all the entries for a particular table
     // with rows in TXN_COMPONENTS
-    Assert.assertEquals(TestTxnDbUtil.queryToString(hiveConf, "select * from COMPACTION_QUEUE"), 1, count);
+    Assert.assertEquals(TestTxnDbUtil.queryToString(hiveConf, "select * from COMPACTION_QUEUE"),
+            useCleanerForAbortCleanup ? 0 : 1, count);
 
     runWorker(hiveConf);
     runCleaner(hiveConf);
@@ -2794,6 +2825,7 @@ public class TestTxnCommands2 extends TxnCommandsBaseForTests {
 
   @Test
   public void testDynPartMergeWithAborts() throws Exception {
+    boolean useCleanerForAbortCleanup = MetastoreConf.getBoolVar(hiveConf, MetastoreConf.ConfVars.COMPACTOR_CLEAN_ABORTS_USING_CLEANER);
     int [][] resultData = new int[][] {{1,1}, {2,2}};
     runStatementOnDriver("insert into " + Table.ACIDTBLPART + " partition(p) values(1,1,'p1'),(2,2,'p1')");
     verifyDeltaDirAndResult(1, Table.ACIDTBLPART.toString(), "p=p1", resultData);
@@ -2827,7 +2859,8 @@ public class TestTxnCommands2 extends TxnCommandsBaseForTests {
     count = TestTxnDbUtil.countQueryAgent(hiveConf, "select count(*) from COMPACTION_QUEUE");
     // Only one job is added to the queue per table. This job corresponds to all the entries for a particular table
     // with rows in TXN_COMPONENTS
-    Assert.assertEquals(TestTxnDbUtil.queryToString(hiveConf, "select * from COMPACTION_QUEUE"), 1, count);
+    Assert.assertEquals(TestTxnDbUtil.queryToString(hiveConf, "select * from COMPACTION_QUEUE"),
+            useCleanerForAbortCleanup ? 0 : 1, count);
 
     r1 = runStatementOnDriver("select count(*) from " + Table.ACIDTBLPART);
     Assert.assertEquals("2", r1.get(0));
@@ -3416,6 +3449,109 @@ public class TestTxnCommands2 extends TxnCommandsBaseForTests {
     Assert.assertEquals(TxnStore.REFUSED_RESPONSE, compacts.get(5).getState());
 
   }
+
+  @Test
+  public void testAbortCompaction() throws Exception {
+
+    d.destroy();
+    hiveConf.setVar(HiveConf.ConfVars.DYNAMICPARTITIONINGMODE, "nonstrict");
+    d = new Driver(hiveConf);
+    //generate some compaction history
+    runStatementOnDriver("drop database if exists mydb1 cascade");
+    runStatementOnDriver("create database mydb1");
+
+    runStatementOnDriver("create table mydb1.tbl0 " + "(a int, b int) partitioned by (p string) clustered by (a) into " +
+            BUCKET_COUNT + " buckets stored as orc TBLPROPERTIES ('transactional'='true')");
+    runStatementOnDriver("insert into mydb1.tbl0" + " PARTITION(p) " +
+            " values(1,2,'p1'),(3,4,'p1'),(1,2,'p2'),(3,4,'p2'),(1,2,'p3'),(3,4,'p3')");
+    runStatementOnDriver("alter table mydb1.tbl0" + " PARTITION(p='p1') compact 'MAJOR'");
+    runStatementOnDriver("alter table mydb1.tbl0" + " PARTITION(p='p2') compact 'MAJOR'");
+    TestTxnCommands2.runWorker(hiveConf);
+    TestTxnCommands2.runCleaner(hiveConf);
+    runStatementOnDriver("alter table mydb1.tbl0" + " PARTITION(p='p3') compact 'MAJOR'");
+    runStatementOnDriver("insert into mydb1.tbl0" + " PARTITION(p) " +
+            " values(4,5,'p1'),(6,7,'p1'),(4,5,'p2'),(6,7,'p2'),(4,5,'p3'),(6,7,'p3')");
+    TestTxnCommands2.runWorker(hiveConf);
+    TestTxnCommands2.runCleaner(hiveConf);
+    runStatementOnDriver("insert into mydb1.tbl0" + " PARTITION(p) " +
+            " values(11,12,'p1'),(13,14,'p1'),(11,12,'p2'),(13,14,'p2'),(11,12,'p3'),(13,14,'p3')");
+    runStatementOnDriver("alter table mydb1.tbl0" + " PARTITION (p='p1')  compact 'MINOR'");
+    TestTxnCommands2.runWorker(hiveConf);
+
+    runStatementOnDriver("create table mydb1.tbl1 " + "(a int, b int) partitioned by (ds string) clustered by (a) into " +
+            BUCKET_COUNT + " buckets stored as orc TBLPROPERTIES ('transactional'='true')");
+    runStatementOnDriver("insert into mydb1.tbl1" + " PARTITION(ds) " +
+            " values(1,2,'today'),(3,4,'today'),(1,2,'tomorrow'),(3,4,'tomorrow'),(1,2,'yesterday'),(3,4,'yesterday')");
+    runStatementOnDriver("alter table mydb1.tbl1" + " PARTITION(ds='today') compact 'MAJOR'");
+    TestTxnCommands2.runWorker(hiveConf);
+
+    runStatementOnDriver("drop table if exists myT1");
+    runStatementOnDriver("create table myT1 (a int, b int) stored as orc TBLPROPERTIES ('transactional'='true')");
+    runStatementOnDriver("insert into myT1 values(0,2)");//makes delta_1_1 in T1
+    runStatementOnDriver("insert into myT1 values(1,4)");//makes delta_2_2 in T2
+
+    //create failed compaction attempt so that compactor txn is aborted
+    HiveConf.setBoolVar(hiveConf, HiveConf.ConfVars.HIVETESTMODEFAILCOMPACTION, true);
+    runStatementOnDriver("alter table myT1 compact 'minor'");
+    TestTxnCommands2.runWorker(hiveConf);
+    // Verify  compaction order
+    List<ShowCompactResponseElement> compacts =
+            txnHandler.showCompact(new ShowCompactRequest()).getCompacts();
+    Assert.assertEquals(6, compacts.size());
+    Assert.assertEquals(TxnStore.INITIATED_RESPONSE, compacts.get(0).getState());
+    Assert.assertEquals(TxnStore.REFUSED_RESPONSE, compacts.get(1).getState());
+    Assert.assertEquals(TxnStore.CLEANING_RESPONSE, compacts.get(2).getState());
+    Assert.assertEquals(TxnStore.CLEANING_RESPONSE, compacts.get(3).getState());
+    Assert.assertEquals(TxnStore.SUCCEEDED_RESPONSE, compacts.get(4).getState());
+    Assert.assertEquals(TxnStore.REFUSED_RESPONSE, compacts.get(5).getState());
+    Map<Long, AbortCompactionResponseElement> expectedResponseMap = new HashMap<Long, AbortCompactionResponseElement>() {{
+      put(Long.parseLong("6"),getAbortCompactionResponseElement(Long.parseLong("6"), "Success",
+              "Successfully aborted compaction"));
+      put(Long.parseLong("1") ,getAbortCompactionResponseElement(Long.parseLong("1"), "Error",
+              "Error while aborting compaction as compaction is in state-refused"));
+      put(Long.parseLong("2"),getAbortCompactionResponseElement(Long.parseLong("2"), "Error",
+              "Error while aborting compaction as compaction is in state-succeeded"));
+      put(Long.parseLong("3"),getAbortCompactionResponseElement(Long.parseLong("3"), "Error",
+              "Error while aborting compaction as compaction is in state-ready for cleaning"));
+      put(Long.parseLong("4"),getAbortCompactionResponseElement(Long.parseLong("4"), "Error",
+              "Error while aborting compaction as compaction is in state-ready for cleaning"));
+      put(Long.parseLong("5"),getAbortCompactionResponseElement(Long.parseLong("5"), "Error",
+              "Error while aborting compaction as compaction is in state-refused"));
+      put(Long.parseLong("12"),getAbortCompactionResponseElement(Long.parseLong("12"), "Error",
+              "No Such Compaction Id Available"));
+    }};
+
+    List<Long> compactionsToAbort = Arrays.asList(Long.parseLong("12"), compacts.get(0).getId(),
+            compacts.get(1).getId(), compacts.get(2).getId(), compacts.get(3).getId(), compacts.get(4).getId(),
+            compacts.get(5).getId());
+
+    AbortCompactionRequest rqst = new AbortCompactionRequest();
+    rqst.setCompactionIds(compactionsToAbort);
+    AbortCompactResponse resp = txnHandler.abortCompactions(rqst);
+    Assert.assertEquals(7, resp.getAbortedcompactsSize());
+    Map<Long, AbortCompactionResponseElement> testResp = resp.getAbortedcompacts();
+
+    Assert.assertEquals(expectedResponseMap, testResp);
+
+    //assert aborted compaction state
+    compacts = txnHandler.showCompact(new ShowCompactRequest()).getCompacts();
+    Assert.assertEquals(6, compacts.size());
+    Assert.assertEquals(TxnStore.ABORTED_RESPONSE, compacts.get(0).getState());
+    Assert.assertEquals(TxnStore.REFUSED_RESPONSE, compacts.get(1).getState());
+    Assert.assertEquals(TxnStore.CLEANING_RESPONSE, compacts.get(2).getState());
+    Assert.assertEquals(TxnStore.CLEANING_RESPONSE, compacts.get(3).getState());
+    Assert.assertEquals(TxnStore.SUCCEEDED_RESPONSE, compacts.get(4).getState());
+    Assert.assertEquals(TxnStore.REFUSED_RESPONSE, compacts.get(5).getState());
+
+  }
+
+  private AbortCompactionResponseElement getAbortCompactionResponseElement(long compactionId, String status, String message){
+    AbortCompactionResponseElement resEle = new AbortCompactionResponseElement(compactionId);
+    resEle.setMessage(message);
+    resEle.setStatus(status);
+    return resEle;
+  }
+
   private void compactPartition(String table, CompactionType type, String partition)
       throws Exception {
     CompactionRequest compactionRequest = new CompactionRequest("default", table, type);

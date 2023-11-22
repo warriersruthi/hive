@@ -1471,7 +1471,7 @@ public class StatsRulesProcFactory {
 
   /**
    * GROUPBY operator changes the number of rows. The number of rows emitted by GBY operator will be
-   * atleast 1 or utmost T(R) (number of rows in relation T) based on the aggregation. A better
+   * at least 1 or utmost T(R) (number of rows in relation T) based on the aggregation. A better
    * estimate can be found if we have column statistics on the columns that we are grouping on.
    * <p>
    * Suppose if we are grouping by attributes A,B,C and if statistics for columns A,B,C are
@@ -3066,19 +3066,15 @@ public class StatsRulesProcFactory {
       if (parentStats != null) {
         Statistics st = parentStats.clone();
 
-        float udtfFactor=HiveConf.getFloatVar(aspCtx.getConf(), HiveConf.ConfVars.HIVE_STATS_UDTF_FACTOR);
-        long numRows = (long) (parentStats.getNumRows() * udtfFactor);
+        float udtfFactor = HiveConf.getFloatVar(aspCtx.getConf(), HiveConf.ConfVars.HIVE_STATS_UDTF_FACTOR);
+        long numRows = Math.max(StatsUtils.safeMult(parentStats.getNumRows(), udtfFactor), 1);
         long dataSize = StatsUtils.safeMult(parentStats.getDataSize(), udtfFactor);
         st.setNumRows(numRows);
         st.setDataSize(dataSize);
 
         List<ColStatistics> colStatsList = st.getColumnStats();
         if(colStatsList != null) {
-          for (ColStatistics colStats : colStatsList) {
-            colStats.setNumFalses((long) (colStats.getNumFalses() * udtfFactor));
-            colStats.setNumTrues((long) (colStats.getNumTrues() * udtfFactor));
-            colStats.setNumNulls((long) (colStats.getNumNulls() * udtfFactor));
-          }
+          StatsUtils.scaleColStatistics(colStatsList, udtfFactor);
           st.setColumnStats(colStatsList);
         }
 
@@ -3086,7 +3082,7 @@ public class StatsRulesProcFactory {
           LOG.debug("[0] STATS-" + uop.toString() + ": " + st.extendedToString());
         }
 
-        uop.setStatistics(st);
+        uop.setStatistics(applyRuntimeStats(aspCtx.getParseContext().getContext(), st, uop));
       }
       return null;
     }

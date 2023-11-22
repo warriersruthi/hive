@@ -19,6 +19,7 @@
 package org.apache.hadoop.hive.metastore;
 
 import java.sql.SQLException;
+import java.sql.SQLIntegrityConstraintViolationException;
 import java.sql.SQLTransactionRollbackException;
 import java.sql.Timestamp;
 import java.util.ArrayList;
@@ -26,7 +27,9 @@ import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
+import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.apache.hadoop.conf.Configurable;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hive.metastore.api.MetaException;
@@ -47,6 +50,10 @@ import com.google.common.base.Preconditions;
  * */
 public class DatabaseProduct implements Configurable {
   static final private Logger LOG = LoggerFactory.getLogger(DatabaseProduct.class.getName());
+  private static final Class<SQLException>[] unrecoverableSqlExceptions = new Class[]{
+          // TODO: collect more unrecoverable SQLExceptions
+          SQLIntegrityConstraintViolationException.class
+  };
 
   public enum DbType {DERBY, MYSQL, POSTGRES, ORACLE, SQLSERVER, CUSTOM, UNDEFINED};
   public DbType dbType;
@@ -152,6 +159,11 @@ public class DatabaseProduct implements Configurable {
       dbt = DbType.UNDEFINED;
     }
     return dbt;
+  }
+
+  public static boolean isRecoverableException(Throwable t) {
+    return Stream.of(unrecoverableSqlExceptions)
+                 .allMatch(ex -> ExceptionUtils.indexOfType(t, ex) < 0);
   }
 
   public final boolean isDERBY() {
@@ -689,6 +701,48 @@ public class DatabaseProduct implements Configurable {
       break;
     }
     return map;
+  }
+
+  /**
+   * Gets the multiple row insert query for the given table with specified columns and row format
+   * @param tableName table name to be used in query
+   * @param columns comma separated column names string
+   * @param rowFormat values format string used in the insert query. Format is like (?,?...?) and the number of
+   *                  question marks in the format is equal to number of column names in the columns argument
+   * @param batchCount number of rows in the query
+   * @return database specific multiple row insert query
+   */
+  public String getBatchInsertQuery(String tableName, String columns, String rowFormat, int batchCount) {
+    StringBuilder sb = new StringBuilder();
+    String fixedPart = tableName + " " + columns + " values ";
+    String row;
+    if (isORACLE()) {
+      sb.append("insert all ");
+      row = "into " + fixedPart + rowFormat + " ";
+    } else {
+      sb.append("insert into " + fixedPart);
+      row = rowFormat + ',';
+    }
+    for (int i = 0; i < batchCount; i++) {
+      sb.append(row);
+    }
+    if (isORACLE()) {
+      sb.append("select * from dual ");
+    }
+    sb.setLength(sb.length() - 1);
+    return sb.toString();
+  }
+
+  /**
+   * Gets the boolean value specific to database for the given input
+   * @param val boolean value
+   * @return database specific value
+   */
+  public Object getBoolean(boolean val) {
+    if (isDERBY()) {
+      return val ? "Y" : "N";
+    }
+    return val;
   }
 
   // This class implements the Configurable interface for the benefit

@@ -18,6 +18,7 @@
 
 package org.apache.hadoop.hive.metastore;
 
+import org.apache.commons.lang3.tuple.Pair;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.hive.metastore.api.EnvironmentContext;
@@ -49,11 +50,19 @@ public interface HiveMetaHook {
   String ALLOW_PARTITION_KEY_CHANGE = "allow_partition_key_change";
   String SET_PROPERTIES = "set_properties";
   String UNSET_PROPERTIES = "unset_properties";
+
+  String TABLE_TYPE = "table_type";
+
+  String ICEBERG = "ICEBERG";
   String PROPERTIES_SEPARATOR = "'";
   String MIGRATE_HIVE_TO_ICEBERG = "migrate_hive_to_iceberg";
   String INITIALIZE_ROLLBACK_MIGRATION = "initialize_rollback_migration";
   // if this flag is set to true, the HMS call from HiveMetaStoreClient#alter_table() will be skipped
   String SKIP_METASTORE_ALTER = "skip_metastore_alter";
+
+  String OLD_TABLE_NAME = "old_table_name";
+
+  String OLD_DB_NAME = "old_db_name";
 
   /**
    * Called before a new table definition is added to the metastore
@@ -167,6 +176,10 @@ public interface HiveMetaHook {
    * @throws MetaException
    */
   public default void preTruncateTable(Table table, EnvironmentContext context) throws MetaException {
+    preTruncateTable(table, context, null);
+  }
+
+  public default void preTruncateTable(Table table, EnvironmentContext context, List<String> partNames) throws MetaException {
     // Do nothing
   }
 
@@ -183,6 +196,18 @@ public interface HiveMetaHook {
    * @param table
    */
   default void postGetTable(Table table) {
+    // Do nothing
+  }
+
+  /**
+   * Called before dropping the partitions from the table in the metastore during ALTER TABLE DROP PARTITION.
+   * @param table table whose partition needs to be dropped
+   * @param context context of the  operation
+   * @param partExprs List of partition expressions
+   * @throws MetaException
+   */
+  default void preDropPartitions(Table table,
+      EnvironmentContext context, List<Pair<Integer, byte[]>> partExprs) throws MetaException {
     // Do nothing
   }
 }

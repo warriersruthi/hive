@@ -255,8 +255,8 @@ public class SessionState implements ISessionAuthState{
 
   private String currentCatalog;
 
-  private final String CONFIG_AUTHZ_SETTINGS_APPLIED_MARKER =
-      "hive.internal.ss.authz.settings.applied.marker";
+  private static final String CONFIG_AUTHZ_SETTINGS_APPLIED_MARKER =
+      "_hive.ss.authz.settings.applied.marker";
 
   private String userIpAddress;
 
@@ -334,6 +334,12 @@ public class SessionState implements ISessionAuthState{
 
   private Hive hiveDb;
   private final Map<String, QueryState> queryStateMap = new HashMap<>();
+
+  /**
+   * Marker flag to indicate that the current SessionState (and Driver) instance is used for executing compaction queries only.
+   * It is required to exclude compaction related queries from all Ranger policies that would otherwise apply.
+   */
+  private boolean compaction = false;
 
   public QueryState getQueryState(String queryId) {
     return queryStateMap.get(queryId);
@@ -432,6 +438,14 @@ public class SessionState implements ISessionAuthState{
 
   public void setIsHiveServerQuery(boolean isHiveServerQuery) {
     this.isHiveServerQuery = isHiveServerQuery;
+  }
+
+  public boolean isCompaction() {
+    return compaction;
+  }
+
+  public void setCompaction(boolean compaction) {
+    this.compaction = compaction;
   }
 
   public SessionState(HiveConf conf) {
@@ -1092,7 +1106,7 @@ public class SessionState implements ISessionAuthState{
   public static Registry getRegistryForWrite() {
     Registry registry = getRegistry();
     if (registry == null) {
-      throw new RuntimeException("Function registery for session is not initialized");
+      throw new RuntimeException("Function registry for session is not initialized");
     }
     return registry;
   }
@@ -1305,6 +1319,45 @@ public class SessionState implements ISessionAuthState{
         getInfoStream().println(info);
       }
       LOG.info(info + StringUtils.defaultString(detail));
+    }
+
+    /**
+     * Logs warn into the log file, and if the LogHelper is not silent then into the HiveServer2 or
+     * HiveCli info stream too.
+     * BeeLine uses the operation log file to show the logs to the user, so depending on the
+     * BeeLine settings it could be shown to the user.
+     * @param warn The log message
+     */
+    public void printWarn(String warn) {
+      printWarn(warn, null);
+    }
+
+    /**
+     * Logs warn into the log file, and if the LogHelper is not silent then into the HiveServer2 or
+     * HiveCli info stream too. Handles an extra detail which will not be printed if null.
+     * BeeLine uses the operation log file to show the logs to the user, so depending on the
+     * BeeLine settings it could be shown to the user.
+     * @param warn The log message
+     * @param detail Extra detail to log which will be not printed if null
+     */
+    public void printWarn(String warn, String detail) {
+      printWarn(warn, detail, getIsSilent());
+    }
+
+    /**
+     * Logs warn into the log file, and if not silent then into the HiveServer2 or HiveCli info
+     * stream too. Handles an extra detail which will not be printed if null.
+     * BeeLine uses the operation log file to show the logs to the user, so depending on the
+     * BeeLine settings it could be shown to the user.
+     * @param warn The log message
+     * @param detail Extra detail to log which will be not printed if null
+     * @param isSilent If true then the message will not be printed to the info stream
+     */
+    public void printWarn(String warn, String detail, boolean isSilent) {
+      if (!isSilent) {
+        getInfoStream().println(warn);
+      }
+      LOG.warn(warn + StringUtils.defaultString(detail));
     }
 
     /**
